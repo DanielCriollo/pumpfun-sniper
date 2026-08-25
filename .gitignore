@@ -1,0 +1,9 @@
+node_modules/
+dist/
+logs/
+.env
+*.env.local
+*.key
+*.pem
+.DS_Store
+*.js.map
