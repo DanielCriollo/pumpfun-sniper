@@ -41,6 +41,8 @@ export interface Config {
 
   // Salida por tiempo (posiciones zombie)
   MAX_HOLD_MINUTES: number;               // 15 → cerrar posición si lleva > 15 min
+  SL_TIGHTEN_AFTER_MINUTES: number;     // min sin TP antes de apretar SL
+  SL_TIGHT_PERCENT: number;             // SL apretado tras N min estancado
 
   // Servidor de control
   API_PORT: number;

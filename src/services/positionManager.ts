@@ -230,13 +230,15 @@ function updateTrailingSLPhases(position: Position): void {
   const entry = position.entryMarketCapSol;
   const current = position.currentMarketCapSol;
   const gainPercent = ((current - entry) / entry) * 100;
+  const holdMin = (Date.now() - position.entryTimestamp) / 60_000;
 
+  // Actualizar High Water Mark
   if (current > (position.highWaterMarkMcap ?? entry)) {
     position.highWaterMarkMcap = current;
   }
-
   const hwm = position.highWaterMarkMcap ?? entry;
 
+  // Fase 2 — Trailing SL activo: SL = HWM * (1 - TRAILING_SL_DISTANCE_PERCENT%)
   if (gainPercent >= config.TRAILING_SL_ACTIVATE_PERCENT) {
     position.trailingSLActive = true;
     position.breakevenActive = true;
@@ -256,17 +258,48 @@ function updateTrailingSLPhases(position: Position): void {
         '📈 Trailing SL actualizado',
       );
     }
-  } else if (gainPercent >= config.TRAILING_SL_BREAKEVEN_PERCENT) {
+    return;
+  }
+
+  // Fase 1 — Breakeven: SL sube a precio de entrada
+  // Se activa si gain >= TRAILING_SL_BREAKEVEN_PERCENT O si ya se ejecutó TP1
+  if (gainPercent >= config.TRAILING_SL_BREAKEVEN_PERCENT || position.tp1Hit) {
     if (!position.breakevenActive) {
       position.breakevenActive = true;
-      position.effectiveSLThreshold = entry;
+      position.effectiveSLThreshold = Math.max(
+        position.effectiveSLThreshold ?? 0,
+        entry,
+      );
       logger.info(
         {
           mint: position.mint,
           gainPercent: gainPercent.toFixed(1),
           slThreshold: entry.toFixed(4),
+          trigger: position.tp1Hit ? 'TP1 ejecutado' : 'ganancia breakeven',
         },
         '🔒 SL movido a breakeven',
+      );
+    }
+    return;
+  }
+
+  // Fase -1 — SL apretado por tiempo: si lleva >= N min sin llegar a TP1,
+  // sube el SL de -SL_PERCENT% a -SL_TIGHT_PERCENT% para salir rápido
+  if (holdMin >= config.SL_TIGHTEN_AFTER_MINUTES && !position.breakevenActive) {
+    const tightThreshold = entry * (1 - config.SL_TIGHT_PERCENT / 100);
+    if (
+      position.effectiveSLThreshold === undefined ||
+      tightThreshold > position.effectiveSLThreshold
+    ) {
+      position.effectiveSLThreshold = tightThreshold;
+      logger.info(
+        {
+          mint: position.mint,
+          holdMin: holdMin.toFixed(1),
+          oldSL: (entry * (1 - config.SL_PERCENT / 100)).toFixed(4),
+          newSL: tightThreshold.toFixed(4),
+        },
+        `⏱️  SL apretado por tiempo (${holdMin.toFixed(1)} min sin TP)`,
       );
     }
   }
@@ -382,6 +415,15 @@ async function executeSell(
 
     if (event === 'TP1_TRIGGERED') {
       position.tp1Hit = true;
+      // Mover SL a breakeven inmediatamente — el capital inicial ya está asegurado
+      if (!position.breakevenActive) {
+        position.breakevenActive = true;
+        position.effectiveSLThreshold = Math.max(
+          position.effectiveSLThreshold ?? 0,
+          position.entryMarketCapSol,
+        );
+        logger.info({ mint: position.mint }, '🔒 SL a breakeven tras TP1 — capital protegido');
+      }
     } else if (event === 'TP2_TRIGGERED') {
       position.tp2Hit = true;
     } else {

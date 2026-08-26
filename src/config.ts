@@ -70,6 +70,8 @@ export const config: Config = {
 
   // Salida por tiempo
   MAX_HOLD_MINUTES: envNumber('MAX_HOLD_MINUTES', 15),
+  SL_TIGHTEN_AFTER_MINUTES: envNumber('SL_TIGHTEN_AFTER_MINUTES', 3),  // apretar SL tras 3 min sin TP
+  SL_TIGHT_PERCENT: envNumber('SL_TIGHT_PERCENT', 7),                   // SL apretado = -7%
 
   // Servidor interno
   API_PORT: envNumber('API_PORT', 3000),
