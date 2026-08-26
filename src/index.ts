@@ -12,6 +12,7 @@ import { applyFilters } from './services/filters';
 import { buyToken } from './services/pumpfun';
 import {
   addPosition,
+  startPositionMonitor,
   processTradeEvent,
   getActivePositionCount,
   hasActivePosition,
@@ -304,6 +305,9 @@ async function main(): Promise<void> {
 
   // Iniciar API interna (Fastify)
   await startServer();
+
+  // Iniciar monitor de posiciones zombie (time-based exit)
+  startPositionMonitor();
 
   // Conectar WebSocket a PumpPortal
   connectWebSocket();

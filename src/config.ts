@@ -54,12 +54,22 @@ export const config: Config = {
   METADATA_TIMEOUT_MS: envNumber('METADATA_TIMEOUT_MS', 3000),
   PUMP_TOTAL_SUPPLY: envNumber('PUMP_TOTAL_SUPPLY', 1_000_000_000),
 
-  // TP/SL
-  TP1_MULTIPLIER: envNumber('TP1_MULTIPLIER', 2.0),
+  // Take Profit (% de ganancia desde la entrada)
+  TP1_PERCENT: envNumber('TP1_PERCENT', 50),       // +50% de ganancia = 1.5x
   TP1_SELL_PERCENT: envNumber('TP1_SELL_PERCENT', 50),
-  TP2_MULTIPLIER: envNumber('TP2_MULTIPLIER', 3.0),
+  TP2_PERCENT: envNumber('TP2_PERCENT', 100),      // +100% de ganancia = 2x
   TP2_SELL_PERCENT: envNumber('TP2_SELL_PERCENT', 25),
-  SL_PERCENT: envNumber('SL_PERCENT', 15),
+
+  // Stop Loss fijo inicial
+  SL_PERCENT: envNumber('SL_PERCENT', 15),         // -15% desde entrada
+
+  // Trailing Stop Loss
+  TRAILING_SL_BREAKEVEN_PERCENT: envNumber('TRAILING_SL_BREAKEVEN_PERCENT', 30),
+  TRAILING_SL_ACTIVATE_PERCENT: envNumber('TRAILING_SL_ACTIVATE_PERCENT', 60),
+  TRAILING_SL_DISTANCE_PERCENT: envNumber('TRAILING_SL_DISTANCE_PERCENT', 15),
+
+  // Salida por tiempo
+  MAX_POSITION_HOLD_TIME_MINUTES: envNumber('MAX_POSITION_HOLD_TIME_MINUTES', 15),
 
   // Servidor interno
   API_PORT: envNumber('API_PORT', 3000),
@@ -77,10 +87,15 @@ export const config: Config = {
   MAX_CONCURRENT_POSITIONS: envNumber('MAX_CONCURRENT_POSITIONS', 5),
 };
 
+// -----------------------------------------------------------
 // Validaciones de cordura post-carga
+// -----------------------------------------------------------
 if (config.TP1_SELL_PERCENT + config.TP2_SELL_PERCENT > 100) {
   throw new Error('[Config] TP1_SELL_PERCENT + TP2_SELL_PERCENT no puede superar 100');
 }
-if (config.TP1_MULTIPLIER >= config.TP2_MULTIPLIER) {
-  throw new Error('[Config] TP1_MULTIPLIER debe ser menor que TP2_MULTIPLIER');
+if (config.TP1_PERCENT >= config.TP2_PERCENT) {
+  throw new Error('[Config] TP1_PERCENT debe ser menor que TP2_PERCENT');
+}
+if (config.TRAILING_SL_BREAKEVEN_PERCENT >= config.TRAILING_SL_ACTIVATE_PERCENT) {
+  throw new Error('[Config] TRAILING_SL_BREAKEVEN_PERCENT debe ser menor que TRAILING_SL_ACTIVATE_PERCENT');
 }

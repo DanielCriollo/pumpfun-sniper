@@ -6,6 +6,8 @@ import { sendWebhook } from './webhook';
 
 // -----------------------------------------------------------
 // Gestor Algorítmico de Posiciones — Módulo C
+// Incluye: TP% basado en ganancia, Trailing SL con HWM,
+//          y salida automática por tiempo (posiciones zombie).
 // -----------------------------------------------------------
 
 /** Mapa mint → Position (fuente de verdad en memoria) */
@@ -44,10 +46,18 @@ export function hasActivePosition(mint: string): boolean {
 }
 
 // -----------------------------------------------------------
-// Creación de posición
+// Creación de posición — inicializa campos de trailing SL
 // -----------------------------------------------------------
 
 export function addPosition(position: Position): void {
+  // Inicializar estado del trailing SL
+  position.highWaterMarkMcap = position.entryMarketCapSol;
+  position.breakevenActive = false;
+  position.trailingSLActive = false;
+  // SL inicial: entry * (1 - SL_PERCENT / 100)
+  position.effectiveSLThreshold =
+    position.entryMarketCapSol * (1 - config.SL_PERCENT / 100);
+
   positions.set(position.mint, position);
   logger.info(
     {
@@ -55,6 +65,7 @@ export function addPosition(position: Position): void {
       name: position.name,
       entryMcap: position.entryMarketCapSol,
       tokenBalance: position.tokenBalance,
+      initialSLThreshold: position.effectiveSLThreshold.toFixed(4),
       totalActive: getActivePositionCount(),
     },
     '📂 Posición abierta',
@@ -76,12 +87,80 @@ export async function processTradeEvent(event: TradeEvent): Promise<void> {
   // Actualizar market cap en tiempo real
   position.currentMarketCapSol = event.marketCapSol;
 
+  // Actualizar High Water Mark y recalcular trailing SL
+  updateTrailingSLPhases(position);
+
   // Evaluar condiciones de salida
   await evaluateTpSl(position);
 }
 
 // -----------------------------------------------------------
-// Lógica TP/SL
+// Trailing Stop Loss — actualización de fases y HWM
+// -----------------------------------------------------------
+
+/**
+ * Recalcula el effectiveSLThreshold según la fase actual:
+ *
+ *  Fase 0 (inicial):   SL fijo = entry * (1 - SL_PERCENT%)
+ *  Fase 1 (breakeven): Si gain >= TRAILING_SL_BREAKEVEN_PERCENT%
+ *                      → SL sube a entry (sin pérdida)
+ *  Fase 2 (trailing):  Si gain >= TRAILING_SL_ACTIVATE_PERCENT%
+ *                      → SL = HWM * (1 - TRAILING_SL_DISTANCE_PERCENT%)
+ *                         y se actualiza con cada nuevo HWM
+ */
+function updateTrailingSLPhases(position: Position): void {
+  const entry = position.entryMarketCapSol;
+  const current = position.currentMarketCapSol;
+  const gainPercent = ((current - entry) / entry) * 100;
+
+  // Actualizar HWM si el precio está subiendo
+  if (current > (position.highWaterMarkMcap ?? entry)) {
+    position.highWaterMarkMcap = current;
+  }
+
+  const hwm = position.highWaterMarkMcap ?? entry;
+
+  if (gainPercent >= config.TRAILING_SL_ACTIVATE_PERCENT) {
+    // Fase 2: trailing SL activo — seguir el HWM hacia arriba
+    position.trailingSLActive = true;
+    position.breakevenActive = true;
+    const trailThreshold = hwm * (1 - config.TRAILING_SL_DISTANCE_PERCENT / 100);
+    // El trailing SL solo sube, nunca baja
+    if (
+      position.effectiveSLThreshold === undefined ||
+      trailThreshold > position.effectiveSLThreshold
+    ) {
+      position.effectiveSLThreshold = trailThreshold;
+      logger.debug(
+        {
+          mint: position.mint,
+          hwm: hwm.toFixed(4),
+          newSL: trailThreshold.toFixed(4),
+          gainPercent: gainPercent.toFixed(1),
+        },
+        '📈 Trailing SL actualizado',
+      );
+    }
+  } else if (gainPercent >= config.TRAILING_SL_BREAKEVEN_PERCENT) {
+    // Fase 1: SL sube a breakeven (entry)
+    if (!position.breakevenActive) {
+      position.breakevenActive = true;
+      position.effectiveSLThreshold = entry; // SL = precio de entrada
+      logger.info(
+        {
+          mint: position.mint,
+          gainPercent: gainPercent.toFixed(1),
+          slThreshold: entry.toFixed(4),
+        },
+        '🔒 SL movido a breakeven',
+      );
+    }
+  }
+  // Si gain < TRAILING_SL_BREAKEVEN_PERCENT: mantener SL fijo inicial
+}
+
+// -----------------------------------------------------------
+// Lógica TP/SL — evaluación en cada tick de precio
 // -----------------------------------------------------------
 
 async function evaluateTpSl(position: Position): Promise<void> {
@@ -90,23 +169,30 @@ async function evaluateTpSl(position: Position): Promise<void> {
 
   const entry = position.entryMarketCapSol;
   const current = position.currentMarketCapSol;
-  const multiplier = current / entry; // ej. 2.0 = 2x
+  const gainPercent = ((current - entry) / entry) * 100;
+
+  // Umbral de SL efectivo (puede ser fijo, breakeven o trailing)
+  const slThreshold =
+    position.effectiveSLThreshold ?? entry * (1 - config.SL_PERCENT / 100);
 
   // ----- Stop Loss (máxima prioridad) -----
-  // Disparar si cae SL_PERCENT% desde la entrada, sin importar qué TPs se han ejecutado
-  const slThreshold = entry * (1 - config.SL_PERCENT / 100);
   if (current <= slThreshold) {
+    const slLabel = position.trailingSLActive
+      ? 'Trailing SL'
+      : position.breakevenActive
+        ? 'Breakeven SL'
+        : 'SL fijo';
     await executeSell(
       position,
-      position.tokenBalance, // 100% de lo que queda
+      position.tokenBalance,
       'SL_TRIGGERED',
-      `SL @ ${current.toFixed(4)} SOL mcap (entrada: ${entry.toFixed(4)})`,
+      `${slLabel} @ ${current.toFixed(4)} SOL mcap (umbral: ${slThreshold.toFixed(4)})`,
     );
     return;
   }
 
-  // ----- TP2 (antes que TP1 si los dos se disparan a la vez) -----
-  if (!position.tp2Hit && multiplier >= config.TP2_MULTIPLIER) {
+  // ----- TP2 (antes que TP1 si ambos se disparan a la vez) -----
+  if (!position.tp2Hit && gainPercent >= config.TP2_PERCENT) {
     const sellAmount = Math.floor(
       position.initialTokenBalance * (config.TP2_SELL_PERCENT / 100),
     );
@@ -115,14 +201,14 @@ async function evaluateTpSl(position: Position): Promise<void> {
         position,
         sellAmount,
         'TP2_TRIGGERED',
-        `TP2 @ ${multiplier.toFixed(2)}x mcap (${current.toFixed(4)} SOL)`,
+        `TP2 @ +${gainPercent.toFixed(1)}% ganancia (${current.toFixed(4)} SOL mcap)`,
       );
     }
     return;
   }
 
   // ----- TP1 -----
-  if (!position.tp1Hit && multiplier >= config.TP1_MULTIPLIER) {
+  if (!position.tp1Hit && gainPercent >= config.TP1_PERCENT) {
     const sellAmount = Math.floor(
       position.initialTokenBalance * (config.TP1_SELL_PERCENT / 100),
     );
@@ -131,7 +217,7 @@ async function evaluateTpSl(position: Position): Promise<void> {
         position,
         sellAmount,
         'TP1_TRIGGERED',
-        `TP1 @ ${multiplier.toFixed(2)}x mcap (${current.toFixed(4)} SOL)`,
+        `TP1 @ +${gainPercent.toFixed(1)}% ganancia (${current.toFixed(4)} SOL mcap)`,
       );
     }
     return;
@@ -168,12 +254,18 @@ async function executeSell(
   try {
     const result = await sellToken(position.mint, tokenAmount);
 
+    // Calcular PnL estimado en %
+    const pnlPercent =
+      ((position.currentMarketCapSol - position.entryMarketCapSol) /
+        position.entryMarketCapSol) *
+      100;
+
     // Registrar el trade
     const record: TradeRecord = {
       timestamp: Date.now(),
       action: 'SELL',
       tokenAmount,
-      solAmount: 0, // No conocemos el SOL exacto hasta consultar la tx
+      solAmount: 0,
       marketCapSol: position.currentMarketCapSol,
       signature: result.signature,
       reason,
@@ -188,7 +280,7 @@ async function executeSell(
     } else if (event === 'TP2_TRIGGERED') {
       position.tp2Hit = true;
     } else {
-      // SL o Panic: cerrar posición
+      // SL, Panic o Time Expired: cerrar posición
       position.status = 'CLOSED';
       position.tokenBalance = 0;
     }
@@ -203,6 +295,7 @@ async function executeSell(
         mint: position.mint,
         signature: result.signature,
         newBalance: position.tokenBalance,
+        pnlPercent: pnlPercent.toFixed(2) + '%',
         status: position.status,
       },
       `✅ ${event} ejecutado`,
@@ -217,6 +310,7 @@ async function executeSell(
       marketCapSol: position.currentMarketCapSol,
       tokenAmount,
       signature: result.signature,
+      pnlPercent: parseFloat(pnlPercent.toFixed(2)),
       timestamp: Date.now(),
       position: {
         entryMarketCapSol: position.entryMarketCapSol,
@@ -248,11 +342,6 @@ async function executeSell(
 // Panic Sell — llamado desde el servidor HTTP
 // -----------------------------------------------------------
 
-/**
- * Liquida inmediatamente el 100% del balance de `mint`.
- * Usado por el endpoint POST /api/panic-sell/:mint y
- * desde n8n vía Telegram.
- */
 export async function executePanicSell(mint: string): Promise<void> {
   const position = positions.get(mint);
   if (!position) {
@@ -270,5 +359,58 @@ export async function executePanicSell(mint: string): Promise<void> {
     position.tokenBalance,
     'PANIC_SELL',
     'Panic sell manual',
+  );
+}
+
+// -----------------------------------------------------------
+// Monitor de tiempo — cierre automático de posiciones zombie
+// -----------------------------------------------------------
+
+/**
+ * Inicia un setInterval que revisa cada 60 segundos si alguna
+ * posición activa lleva más de MAX_POSITION_HOLD_TIME_MINUTES.
+ * Llamar una sola vez desde main().
+ */
+export function startPositionMonitor(): void {
+  const intervalMs = 60_000;
+  const maxMs = config.MAX_POSITION_HOLD_TIME_MINUTES * 60_000;
+
+  setInterval(() => {
+    const now = Date.now();
+
+    for (const position of positions.values()) {
+      if (position.status !== 'ACTIVE') continue;
+      if (sellLocks.has(position.mint)) continue;
+
+      const holdMs = now - position.entryTimestamp;
+      if (holdMs < maxMs) continue;
+
+      const holdMin = (holdMs / 60_000).toFixed(1);
+      logger.warn(
+        {
+          mint: position.mint,
+          symbol: position.symbol,
+          holdMinutes: holdMin,
+          limit: config.MAX_POSITION_HOLD_TIME_MINUTES,
+          tokenBalance: position.tokenBalance,
+        },
+        `⏰ Posición zombie detectada — cerrando por tiempo (${holdMin} min)`,
+      );
+
+      void executeSell(
+        position,
+        position.tokenBalance,
+        'POSITION_CLOSED_TIME_EXPIRED',
+        `Time-based exit: posición abierta ${holdMin} min (límite: ${config.MAX_POSITION_HOLD_TIME_MINUTES} min)`,
+      );
+    }
+  }, intervalMs);
+
+  logger.info(
+    {
+      checkIntervalMin: 1,
+      maxHoldMin: config.MAX_POSITION_HOLD_TIME_MINUTES,
+    },
+    '⏱️  Monitor de tiempo de posiciones iniciado',
   );
 }

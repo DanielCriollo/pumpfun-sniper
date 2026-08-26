@@ -25,12 +25,22 @@ export interface Config {
   METADATA_TIMEOUT_MS: number;
   PUMP_TOTAL_SUPPLY: number; // 1_000_000_000 para pump.fun
 
-  // Take Profit / Stop Loss
-  TP1_MULTIPLIER: number;       // 2.0 → 2x market cap
-  TP1_SELL_PERCENT: number;     // 50 → vender 50% del balance inicial
-  TP2_MULTIPLIER: number;       // 3.0 → 3x market cap
-  TP2_SELL_PERCENT: number;     // 25 → vender 25% adicional del balance inicial
-  SL_PERCENT: number;           // 15 → stop loss en -15% desde entrada
+  // Take Profit (basado en % de ganancia sobre entrada)
+  TP1_PERCENT: number;       // 50  → vender al +50% de ganancia (1.5x mcap)
+  TP1_SELL_PERCENT: number;  // 50  → vender el 50% del balance inicial
+  TP2_PERCENT: number;       // 100 → vender al +100% de ganancia (2x mcap)
+  TP2_SELL_PERCENT: number;  // 25  → vender el 25% adicional del balance inicial
+
+  // Stop Loss fijo (inicial)
+  SL_PERCENT: number;        // 15  → stop loss en -15% desde entrada
+
+  // Trailing Stop Loss
+  TRAILING_SL_BREAKEVEN_PERCENT: number;  // 30 → al +30%, SL sube a breakeven (entrada)
+  TRAILING_SL_ACTIVATE_PERCENT: number;   // 60 → al +60%, activa trailing
+  TRAILING_SL_DISTANCE_PERCENT: number;   // 15 → trailing SL = HWM - 15%
+
+  // Salida por tiempo (posiciones zombie)
+  MAX_POSITION_HOLD_TIME_MINUTES: number; // 15 → cerrar posición si lleva > 15 min
 
   // Servidor de control
   API_PORT: number;
@@ -124,8 +134,17 @@ export interface Position {
 
   status: 'ACTIVE' | 'CLOSED';
   bondingCurveKey: string;
-
   trades: TradeRecord[];
+
+  // ------- Trailing Stop Loss (inicializado por addPosition) -------
+  /** Máximo market cap visto desde la apertura */
+  highWaterMarkMcap?: number;
+  /** SL ha subido a breakeven (= entryMarketCapSol) */
+  breakevenActive?: boolean;
+  /** Trailing SL activo (SL = HWM - TRAILING_SL_DISTANCE_PERCENT%) */
+  trailingSLActive?: boolean;
+  /** Umbral de SL efectivo en SOL (se actualiza dinámicamente) */
+  effectiveSLThreshold?: number;
 }
 
 // -----------------------------------------------------------
@@ -138,7 +157,8 @@ export type WebhookEvent =
   | 'SL_TRIGGERED'
   | 'PANIC_SELL'
   | 'TRADE_ERROR'
-  | 'FILTER_REJECTED';
+  | 'FILTER_REJECTED'
+  | 'POSITION_CLOSED_TIME_EXPIRED';
 
 export interface WebhookPayload {
   event: WebhookEvent;
@@ -151,6 +171,7 @@ export interface WebhookPayload {
   signature?: string;
   error?: string;
   filterReason?: string;
+  pnlPercent?: number;       // PnL estimado en % al cerrar la posición
   timestamp: number;
   position?: Partial<Position>;
 }
