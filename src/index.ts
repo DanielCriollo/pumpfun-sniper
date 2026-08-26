@@ -18,7 +18,7 @@ import {
   checkHolderConcentration,
   pruneCreatorRegistry,
 } from './services/filters';
-import { recordFirehose, startRecorder } from './services/recorder';
+import { recordFirehose, recordRejection, startRecorder } from './services/recorder';
 import { buyToken, BuyResult } from './services/pumpfun';
 import {
   addPosition,
@@ -63,6 +63,10 @@ const SYMBOL_COOLDOWN_MS = 30_000; // 30 segundos
 // -----------------------------------------------------------
 
 async function handleNewToken(event: NewTokenEvent): Promise<void> {
+  // Algunos eventos `create` llegan sin symbol/name — normalizar para no crashear
+  event.symbol = event.symbol ?? '';
+  event.name = event.name ?? '';
+
   // 1. Respetar modo pausa
   if (state.isPaused) {
     logger.debug({ mint: event.mint }, 'Bot pausado — token ignorado');
@@ -99,6 +103,12 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
       { mint: event.mint, mcap: event.marketCapSol, max: config.MAX_ENTRY_MCAP_SOL },
       '📉 Market cap inicial demasiado alto — ignorado',
     );
+    recordRejection({
+      mint: event.mint,
+      symbol: event.symbol,
+      reason: `Mcap inicial ${event.marketCapSol.toFixed(1)} SOL > máx ${config.MAX_ENTRY_MCAP_SOL}`,
+      mcapSol: event.marketCapSol,
+    });
     return;
   }
 
@@ -109,6 +119,12 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
       { mint: event.mint, reason: creatorLocal.reason },
       '🚫 Filtro RECHAZADO [creatorLocal]',
     );
+    recordRejection({
+      mint: event.mint,
+      symbol: event.symbol,
+      reason: creatorLocal.reason ?? 'creador en serie',
+      mcapSol: event.marketCapSol,
+    });
     await sendWebhook({
       event: 'FILTER_REJECTED',
       mint: event.mint,
@@ -163,6 +179,12 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
         { mint: event.mint, symbol: event.symbol, reason: rejectionReason },
         '🚫 Entrada RECHAZADA',
       );
+      recordRejection({
+        mint: event.mint,
+        symbol: event.symbol,
+        reason: rejectionReason,
+        mcapSol: obsResult?.finalMcap ?? event.marketCapSol,
+      });
       await sendWebhook({
         event: 'FILTER_REJECTED',
         mint: event.mint,
@@ -201,6 +223,12 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
         { mint: event.mint, reason: holderCheck.reason },
         '🚫 Filtro RECHAZADO [holderConcentration]',
       );
+      recordRejection({
+        mint: event.mint,
+        symbol: event.symbol,
+        reason: holderCheck.reason ?? 'holder concentrado',
+        mcapSol: obsResult?.finalMcap ?? event.marketCapSol,
+      });
       await sendWebhook({
         event: 'FILTER_REJECTED',
         mint: event.mint,
@@ -367,6 +395,8 @@ function onWsMessage(data: WebSocket.RawData): void {
 
   if (txType === 'create') {
     const event = parsed as unknown as NewTokenEvent;
+    // Eventos malformados (sin mint o sin creador) — ignorar
+    if (typeof event.mint !== 'string' || typeof event.traderPublicKey !== 'string') return;
     // Dataset para backtesting: grabar TODOS los create
     recordFirehose('create', parsed);
     // Inteligencia de creadores: registrar TODOS los create, se compre o no

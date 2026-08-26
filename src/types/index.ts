@@ -212,6 +212,8 @@ export interface Position {
   realizedPnlSol?: number;
   /** Condiciones de entrada — para el análisis posterior de qué funciona */
   entryContext?: EntryContext;
+  /** Evento que cerró la posición (SL_TRIGGERED, TP..., DEV_SELL_EXIT, etc.) */
+  exitEvent?: string;
 
   // ------- Trailing Stop Loss (inicializado por addPosition) -------
   /** Máximo market cap visto desde la apertura */

@@ -252,6 +252,7 @@ export async function processTradeEvent(event: TradeEvent): Promise<void> {
 
     if (newBalance < 1) {
       position.tokenBalance = 0;
+      position.exitEvent = 'POSITION_CLOSED_EXTERNAL';
       const realized = closePosition(position);
       const pnlPercent =
         position.solSpent > 0 ? (realized / position.solSpent) * 100 : 0;
@@ -316,7 +317,7 @@ export async function processTradeEvent(event: TradeEvent): Promise<void> {
 // Trailing Stop Loss — actualización de fases y HWM
 // -----------------------------------------------------------
 
-function updateTrailingSLPhases(position: Position): void {
+export function updateTrailingSLPhases(position: Position): void {
   const entry = position.entryMarketCapSol;
   const current = position.currentMarketCapSol;
   const gainPercent = ((current - entry) / entry) * 100;
@@ -399,10 +400,19 @@ function updateTrailingSLPhases(position: Position): void {
 // Lógica TP/SL — evaluación en cada tick de precio y en el monitor
 // -----------------------------------------------------------
 
-async function evaluateTpSl(position: Position): Promise<void> {
-  if (sellLocks.has(position.mint)) return;
-  if (position.tokenBalance < 1) return; // nada que vender aún (balance en recuperación)
+export interface ExitDecision {
+  event: WebhookEvent;
+  tokenAmount: number;
+  reason: string;
+}
 
+/**
+ * Decisión de salida PURA (sin I/O): dado el estado de la posición,
+ * devuelve qué venta corresponde o null si no toca vender.
+ * Separada de evaluateTpSl para poder testearla con secuencias
+ * de precios simuladas sin red ni disco.
+ */
+export function decideExit(position: Position): ExitDecision | null {
   const entry = position.entryMarketCapSol;
   const current = position.currentMarketCapSol;
   const gainPercent = ((current - entry) / entry) * 100;
@@ -416,13 +426,11 @@ async function evaluateTpSl(position: Position): Promise<void> {
       : position.breakevenActive
         ? 'Breakeven SL'
         : 'SL fijo';
-    await executeSell(
-      position,
-      position.tokenBalance,
-      'SL_TRIGGERED',
-      `${slLabel} @ ${current.toFixed(4)} SOL mcap (umbral: ${slThreshold.toFixed(4)})`,
-    );
-    return;
+    return {
+      event: 'SL_TRIGGERED',
+      tokenAmount: position.tokenBalance,
+      reason: `${slLabel} @ ${current.toFixed(4)} SOL mcap (umbral: ${slThreshold.toFixed(4)})`,
+    };
   }
 
   if (!position.tp2Hit && gainPercent >= config.TP2_PERCENT) {
@@ -430,14 +438,13 @@ async function evaluateTpSl(position: Position): Promise<void> {
       position.initialTokenBalance * (config.TP2_SELL_PERCENT / 100),
     );
     if (sellAmount > 0 && position.tokenBalance >= sellAmount) {
-      await executeSell(
-        position,
-        sellAmount,
-        'TP2_TRIGGERED',
-        `TP2 @ +${gainPercent.toFixed(1)}% ganancia (${current.toFixed(4)} SOL mcap)`,
-      );
+      return {
+        event: 'TP2_TRIGGERED',
+        tokenAmount: sellAmount,
+        reason: `TP2 @ +${gainPercent.toFixed(1)}% ganancia (${current.toFixed(4)} SOL mcap)`,
+      };
     }
-    return;
+    return null;
   }
 
   if (!position.tp1Hit && gainPercent >= config.TP1_PERCENT) {
@@ -445,14 +452,25 @@ async function evaluateTpSl(position: Position): Promise<void> {
       position.initialTokenBalance * (config.TP1_SELL_PERCENT / 100),
     );
     if (sellAmount > 0 && position.tokenBalance >= sellAmount) {
-      await executeSell(
-        position,
-        sellAmount,
-        'TP1_TRIGGERED',
-        `TP1 @ +${gainPercent.toFixed(1)}% ganancia (${current.toFixed(4)} SOL mcap)`,
-      );
+      return {
+        event: 'TP1_TRIGGERED',
+        tokenAmount: sellAmount,
+        reason: `TP1 @ +${gainPercent.toFixed(1)}% ganancia (${current.toFixed(4)} SOL mcap)`,
+      };
     }
-    return;
+    return null;
+  }
+
+  return null;
+}
+
+async function evaluateTpSl(position: Position): Promise<void> {
+  if (sellLocks.has(position.mint)) return;
+  if (position.tokenBalance < 1) return; // nada que vender aún (balance en recuperación)
+
+  const decision = decideExit(position);
+  if (decision) {
+    await executeSell(position, decision.tokenAmount, decision.event, decision.reason);
   }
 }
 
@@ -477,6 +495,7 @@ async function executeSell(
       { mint: position.mint, event, tokenAmount },
       '⚠️  Cierre sin venta: balance < 1 token',
     );
+    position.exitEvent = event;
     const realized = closePosition(position);
     await sendWebhook({
       event,
@@ -574,6 +593,7 @@ async function executeSell(
     const isFullExit = position.tokenBalance < 1;
     let realized: number | undefined;
     if (isFullExit) {
+      position.exitEvent = event;
       realized = closePosition(position);
     } else {
       savePositions();

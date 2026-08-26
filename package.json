@@ -8,7 +8,9 @@
     "dev": "ts-node --transpile-only src/index.ts",
     "start": "node dist/index.js",
     "clean": "rm -rf dist",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test dist/tests/",
+    "report": "node dist/tools/report.js"
   },
   "dependencies": {
     "@fastify/rate-limit": "^9.1.0",
