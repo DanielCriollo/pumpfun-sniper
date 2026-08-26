@@ -102,6 +102,7 @@ export const config: Config = {
   // Estrategia de entrada — ventana de observación (0 = snipe inmediato)
   ENTRY_OBSERVATION_SECONDS: envNumber('ENTRY_OBSERVATION_SECONDS', 8),
   MIN_UNIQUE_BUYERS: envNumber('MIN_UNIQUE_BUYERS', 4),
+  MIN_VSOL_IN_CURVE: envNumber('MIN_VSOL_IN_CURVE', 33),
 
   // Filtros de creador
   CREATOR_MAX_TOKENS_PER_DAY: envNumber('CREATOR_MAX_TOKENS_PER_DAY', 1),

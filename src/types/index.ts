@@ -69,6 +69,10 @@ export interface Config {
   // Estrategia de entrada — ventana de observación
   ENTRY_OBSERVATION_SECONDS: number;  // 0 = snipe inmediato al create
   MIN_UNIQUE_BUYERS: number;          // compradores únicos mínimos en la ventana
+  /** SOL mínimos en la bonding curve al entrar (la curva arranca con ~30
+   *  virtuales — 33 ≈ 3 SOL reales). Protege de fills contra piscinas
+   *  vacías donde el mcap es ilusorio. 0 = desactivado. */
+  MIN_VSOL_IN_CURVE: number;
 
   // Filtros de creador
   CREATOR_MAX_TOKENS_PER_DAY: number; // máx. tokens creados por el mismo dev en 24h

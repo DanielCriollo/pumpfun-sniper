@@ -22,12 +22,15 @@ export interface ObservationResult {
   sellCount: number;
   /** Último mcap visto durante la ventana — mejor estimación del precio de entrada */
   finalMcap: number;
+  /** SOL en la bonding curve al cierre de la ventana (liquidez ejecutable) */
+  finalVSol: number;
 }
 
 interface Observation {
   creator: string;
   startMcap: number;
   lastMcap: number;
+  lastVSol: number;
   buyers: Set<string>;
   buyCount: number;
   sellCount: number;
@@ -53,6 +56,7 @@ export function observeToken(event: NewTokenEvent): Promise<ObservationResult> {
       creator: event.traderPublicKey,
       startMcap: event.marketCapSol,
       lastMcap: event.marketCapSol,
+      lastVSol: event.vSolInBondingCurve ?? 0,
       buyers: new Set<string>(),
       buyCount: 0,
       sellCount: 0,
@@ -86,7 +90,20 @@ function evaluateObservation(mint: string): void {
     buyCount: obs.buyCount,
     sellCount: obs.sellCount,
     finalMcap: obs.lastMcap,
+    finalVSol: obs.lastVSol,
   };
+
+  // Liquidez ejecutable: la curva arranca con ~30 SOL virtuales, así que
+  // vSol 33 ≈ solo 3 SOL reales. Un mcap alto con curva vacía es ilusorio:
+  // nuestra propia venta se comería el precio (lección del trade "Bul").
+  if (config.MIN_VSOL_IN_CURVE > 0 && obs.lastVSol < config.MIN_VSOL_IN_CURVE) {
+    obs.finish({
+      passed: false,
+      reason: `Liquidez real insuficiente: ${obs.lastVSol.toFixed(1)} vSOL en curva (mín. ${config.MIN_VSOL_IN_CURVE})`,
+      ...base,
+    });
+    return;
+  }
 
   if (obs.buyers.size < config.MIN_UNIQUE_BUYERS) {
     obs.finish({
@@ -128,6 +145,9 @@ export function handleObservationTrade(event: TradeEvent): boolean {
   if (!obs) return false;
 
   obs.lastMcap = event.marketCapSol;
+  if (typeof event.vSolInBondingCurve === 'number') {
+    obs.lastVSol = event.vSolInBondingCurve;
+  }
 
   // Dev vendiendo durante la ventana = rug inminente → abortar al instante
   if (event.txType === 'sell' && event.traderPublicKey === obs.creator) {
@@ -138,6 +158,7 @@ export function handleObservationTrade(event: TradeEvent): boolean {
       buyCount: obs.buyCount,
       sellCount: obs.sellCount,
       finalMcap: obs.lastMcap,
+      finalVSol: obs.lastVSol,
     });
     return true;
   }

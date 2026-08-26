@@ -22,8 +22,9 @@ const SIM_FEE_FACTOR = 0.985;
 interface PumpTradeParams {
   action: 'buy' | 'sell';
   mint: string;
-  /** SOL si es compra (denominatedInSol=true), tokens si es venta */
-  amount: number;
+  /** SOL si es compra (denominatedInSol=true), tokens si es venta.
+   *  En ventas acepta "100%" para liquidar el balance completo. */
+  amount: number | string;
   denominatedInSol: boolean;
   /** Override de slippage — usado en salidas defensivas con escalado */
   slippagePercent?: number;
@@ -201,6 +202,9 @@ export interface SellOptions {
   slippagePercent?: number;
   /** Mcap actual — para simular el fill en DRY_RUN */
   simMcapSol?: number;
+  /** Salida total: vende el 100% del balance real (sin dejar polvo,
+   *  lo que permite cerrar la ATA y recuperar la renta) */
+  sellAll?: boolean;
 }
 
 /**
@@ -229,14 +233,16 @@ export async function sellToken(
   }
 
   logger.info(
-    { mint, tokenAmount, slippage: opts.slippagePercent ?? config.SLIPPAGE_PERCENT },
+    { mint, tokenAmount, sellAll: opts.sellAll === true, slippage: opts.slippagePercent ?? config.SLIPPAGE_PERCENT },
     '💸 Ejecutando VENTA',
   );
 
   const signature = await executePumpTrade({
     action: 'sell',
     mint,
-    amount: roundedAmount,
+    // "100%" liquida el balance exacto (incluye decimales) → ATA queda
+    // vacía y reclaimAtaRent recupera los ~0.002 SOL de renta
+    amount: opts.sellAll ? '100%' : roundedAmount,
     denominatedInSol: false,
     slippagePercent: opts.slippagePercent,
   });

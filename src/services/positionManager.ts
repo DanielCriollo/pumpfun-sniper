@@ -532,11 +532,15 @@ async function executeSell(
       ? [config.SLIPPAGE_PERCENT, ...ESCALATION_SLIPPAGES.filter((s) => s > config.SLIPPAGE_PERCENT)]
       : [config.SLIPPAGE_PERCENT];
 
+    // Si se vende todo el balance, usar "100%" para no dejar polvo
+    const isFullSell = tokenAmount >= position.tokenBalance;
+
     for (const slippage of slippagePlan) {
       try {
         result = await sellToken(position.mint, tokenAmount, {
           slippagePercent: slippage,
           simMcapSol: position.currentMarketCapSol,
+          sellAll: isFullSell,
         });
         break;
       } catch (err) {
