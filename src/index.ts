@@ -316,8 +316,8 @@ async function main(): Promise<void> {
     {
       buyAmount: config.BUY_AMOUNT_SOL,
       maxPositions: config.MAX_CONCURRENT_POSITIONS,
-      tp1: `${config.TP1_MULTIPLIER}x → sell ${config.TP1_SELL_PERCENT}%`,
-      tp2: `${config.TP2_MULTIPLIER}x → sell ${config.TP2_SELL_PERCENT}%`,
+      tp1: `+${config.TP1_PERCENT}% → sell ${config.TP1_SELL_PERCENT}%`,
+      tp2: `+${config.TP2_PERCENT}% → sell ${config.TP2_SELL_PERCENT}%`,
       sl: `-${config.SL_PERCENT}%`,
     },
     '⚙️  Parámetros de trading',
