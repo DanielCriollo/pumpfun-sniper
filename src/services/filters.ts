@@ -87,6 +87,40 @@ export async function checkCreatorHistory(creator: string): Promise<FilterResult
 }
 
 // -----------------------------------------------------------
+// Check de concentración de holders (post-observación)
+// -----------------------------------------------------------
+// Si una sola wallet (fuera de la bonding curve) acumuló un % alto
+// del supply en los primeros segundos, es el equipo posicionado
+// para dumpear. Se ejecuta DESPUÉS de la ventana de observación,
+// cuando ya existen holders que evaluar.
+
+export async function checkHolderConcentration(mint: string): Promise<FilterResult> {
+  if (config.MAX_HOLDER_PERCENT <= 0) return { passed: true, score: 0 };
+  try {
+    const res = await connection.getTokenLargestAccounts(new PublicKey(mint), 'confirmed');
+    // Ordenados desc — el mayor es (casi siempre) la bonding curve: se omite
+    const holders = res.value.slice(1);
+    for (const h of holders) {
+      const ui = h.uiAmount ?? 0;
+      const pct = (ui / config.PUMP_TOTAL_SUPPLY) * 100;
+      if (pct > config.MAX_HOLDER_PERCENT) {
+        return {
+          passed: false,
+          reason: `Holder con ${pct.toFixed(1)}% del supply (máx. ${config.MAX_HOLDER_PERCENT}%) — riesgo de dump`,
+          score: 0,
+        };
+      }
+    }
+    logger.debug({ mint, holders: holders.length }, 'Check holderConcentration ✓');
+    return { passed: true, score: 0 };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn({ mint, err: msg }, 'checkHolderConcentration: fallo RPC — dejando pasar (fail-open)');
+    return { passed: true, score: 0 };
+  }
+}
+
+// -----------------------------------------------------------
 // Check 1: El dev no compró más del % máximo del supply
 // -----------------------------------------------------------
 function checkDevBuyPercent(event: NewTokenEvent): FilterResult {

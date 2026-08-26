@@ -6,6 +6,7 @@ import {
   VersionedTransaction,
   Transaction,
   SendTransactionError,
+  SystemProgram,
 } from '@solana/web3.js';
 import {
   getAccount,
@@ -26,6 +27,15 @@ export const connection = new Connection(config.RPC_ENDPOINT, {
   confirmTransactionInitialTimeout: 60_000, // ms
 });
 
+/** RPC de respaldo — usado cuando el principal falla en operaciones críticas */
+export const fallbackConnection: Connection | null =
+  config.RPC_FALLBACK_ENDPOINT !== ''
+    ? new Connection(config.RPC_FALLBACK_ENDPOINT, {
+        commitment: 'confirmed',
+        confirmTransactionInitialTimeout: 60_000,
+      })
+    : null;
+
 export const wallet = Keypair.fromSecretKey(bs58.decode(config.PRIVATE_KEY));
 
 logger.info(
@@ -42,8 +52,25 @@ export const PUMP_TOKEN_DECIMALS = 6;
 // Consultas de balance
 // -----------------------------------------------------------
 
-/** Devuelve el balance de SOL del wallet en SOL (no lamports) */
+// -----------------------------------------------------------
+// Balance virtual — modo DRY_RUN (paper trading)
+// -----------------------------------------------------------
+
+let virtualSolBalance = config.DRY_RUN_START_BALANCE_SOL;
+
+/** Ajusta el balance virtual (solo tiene efecto en DRY_RUN) */
+export function adjustVirtualSol(delta: number): void {
+  virtualSolBalance += delta;
+}
+
+export function getVirtualSolBalance(): number {
+  return virtualSolBalance;
+}
+
+/** Devuelve el balance de SOL del wallet en SOL (no lamports).
+ *  En DRY_RUN devuelve el balance virtual simulado. */
 export async function getSolBalance(): Promise<number> {
+  if (config.DRY_RUN) return virtualSolBalance;
   const lamports = await connection.getBalance(wallet.publicKey, 'confirmed');
   return lamports / LAMPORTS_PER_SOL;
 }
@@ -88,8 +115,20 @@ export async function confirmSignature(
   timeoutMs = 45_000,
 ): Promise<void> {
   const start = Date.now();
+  let useFallback = false;
   while (Date.now() - start < timeoutMs) {
-    const status = (await connection.getSignatureStatuses([signature])).value[0];
+    const conn = useFallback && fallbackConnection ? fallbackConnection : connection;
+    let status;
+    try {
+      status = (await conn.getSignatureStatuses([signature])).value[0];
+    } catch (err) {
+      // Error de red en la RPC → alternar al respaldo si existe
+      if (fallbackConnection) useFallback = !useFallback;
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn({ signature, err: msg }, 'Fallo consultando status — alternando RPC');
+      await sleep(500);
+      continue;
+    }
     if (status) {
       if (status.err) {
         throw new Error(
@@ -117,6 +156,9 @@ export async function signAndSendTransaction(
   txBytes: Uint8Array,
 ): Promise<string> {
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
+    // A partir del segundo intento, si hay RPC de respaldo, usarlo
+    const conn =
+      attempt > 1 && fallbackConnection ? fallbackConnection : connection;
     try {
       // Intentar deserializar como VersionedTransaction (v0)
       let signature: string;
@@ -124,7 +166,7 @@ export async function signAndSendTransaction(
       try {
         const vtx = VersionedTransaction.deserialize(txBytes);
         vtx.sign([wallet]);
-        signature = await connection.sendRawTransaction(vtx.serialize(), {
+        signature = await conn.sendRawTransaction(vtx.serialize(), {
           skipPreflight: config.SKIP_PREFLIGHT,
           preflightCommitment: 'confirmed',
           maxRetries: 3,
@@ -133,7 +175,7 @@ export async function signAndSendTransaction(
         // Fallback a transacción legacy
         const tx = Transaction.from(Buffer.from(txBytes));
         tx.partialSign(wallet);
-        signature = await connection.sendRawTransaction(tx.serialize(), {
+        signature = await conn.sendRawTransaction(tx.serialize(), {
           skipPreflight: config.SKIP_PREFLIGHT,
           preflightCommitment: 'confirmed',
           maxRetries: 3,
@@ -295,6 +337,7 @@ export async function getPriorityFeeSol(): Promise<number> {
  * Fire-and-forget seguro: loggea errores sin lanzarlos.
  */
 export async function reclaimAtaRent(mint: PublicKey): Promise<void> {
+  if (config.DRY_RUN) return; // en paper trading no hay ATAs reales
   try {
     const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
 
@@ -340,5 +383,68 @@ export async function reclaimAtaRent(mint: PublicKey): Promise<void> {
     if (err instanceof TokenAccountNotFoundError) return; // ATA ya no existe
     const msg = err instanceof Error ? err.message : String(err);
     logger.warn({ mint: mint.toBase58(), err: msg }, 'reclaimAtaRent: no se pudo cerrar ATA');
+  }
+}
+
+// -----------------------------------------------------------
+// Barrido de ganancias a wallet fría
+// -----------------------------------------------------------
+
+/**
+ * Si el balance supera PROFIT_SWEEP_THRESHOLD_SOL, transfiere el
+ * excedente (dejando PROFIT_SWEEP_KEEP_SOL como capital de trabajo)
+ * a PROFIT_SWEEP_ADDRESS. Limita lo expuesto en la wallet caliente
+ * y es la única forma real de "asegurar" ganancias.
+ * Devuelve el monto barrido, o null si no aplicaba.
+ */
+export async function sweepProfits(): Promise<{ amountSol: number; signature: string } | null> {
+  if (config.DRY_RUN) return null;
+  if (config.PROFIT_SWEEP_ADDRESS === '' || config.PROFIT_SWEEP_THRESHOLD_SOL <= 0) {
+    return null;
+  }
+
+  try {
+    const balance = await getSolBalance();
+    if (balance < config.PROFIT_SWEEP_THRESHOLD_SOL) return null;
+
+    const amountSol = balance - config.PROFIT_SWEEP_KEEP_SOL;
+    if (amountSol < 0.01) return null; // no barrer migajas
+
+    const destination = new PublicKey(config.PROFIT_SWEEP_ADDRESS);
+
+    const tx = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: wallet.publicKey,
+        toPubkey: destination,
+        lamports: Math.floor(amountSol * LAMPORTS_PER_SOL),
+      }),
+    );
+    const { blockhash, lastValidBlockHeight } =
+      await connection.getLatestBlockhash('confirmed');
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = wallet.publicKey;
+    tx.sign(wallet);
+
+    const signature = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+    const result = await connection.confirmTransaction(
+      { signature, blockhash, lastValidBlockHeight },
+      'confirmed',
+    );
+    if (result.value.err) {
+      throw new Error(`Sweep on-chain error: ${JSON.stringify(result.value.err)}`);
+    }
+
+    logger.info(
+      { amountSol: amountSol.toFixed(4), destination: config.PROFIT_SWEEP_ADDRESS, signature },
+      '🏦 Ganancias barridas a wallet fría',
+    );
+    return { amountSol, signature };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn({ err: msg }, 'sweepProfits: fallo en el barrido — se reintentará luego');
+    return null;
   }
 }

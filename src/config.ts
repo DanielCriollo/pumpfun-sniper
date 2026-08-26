@@ -29,6 +29,11 @@ function envBool(key: string, defaultValue: boolean): boolean {
   return raw.toLowerCase() === 'true';
 }
 
+function envString(key: string, defaultValue: string): string {
+  const raw = process.env[key];
+  return raw === undefined ? defaultValue : raw.trim();
+}
+
 // -----------------------------------------------------------
 // Objeto de configuración global (inmutable en runtime)
 // -----------------------------------------------------------
@@ -113,6 +118,28 @@ export const config: Config = {
   DYNAMIC_PRIORITY_FEE: envBool('DYNAMIC_PRIORITY_FEE', false),
   MAX_PRIORITY_FEE_SOL: envNumber('MAX_PRIORITY_FEE_SOL', 0.005),
   SKIP_PREFLIGHT: envBool('SKIP_PREFLIGHT', false),
+
+  // Paper trading
+  DRY_RUN: envBool('DRY_RUN', false),
+  DRY_RUN_START_BALANCE_SOL: envNumber('DRY_RUN_START_BALANCE_SOL', 1),
+
+  // Salida por muerte de volumen
+  VOLUME_EXIT_WINDOW_SEC: envNumber('VOLUME_EXIT_WINDOW_SEC', 45),
+  VOLUME_EXIT_MIN_TRADES: envNumber('VOLUME_EXIT_MIN_TRADES', 3),
+
+  // RPC de respaldo
+  RPC_FALLBACK_ENDPOINT: envString('RPC_FALLBACK_ENDPOINT', ''),
+
+  // Concentración de holders
+  MAX_HOLDER_PERCENT: envNumber('MAX_HOLDER_PERCENT', 15),
+
+  // Barrido de ganancias
+  PROFIT_SWEEP_ADDRESS: envString('PROFIT_SWEEP_ADDRESS', ''),
+  PROFIT_SWEEP_THRESHOLD_SOL: envNumber('PROFIT_SWEEP_THRESHOLD_SOL', 0),
+  PROFIT_SWEEP_KEEP_SOL: envNumber('PROFIT_SWEEP_KEEP_SOL', 0.5),
+
+  // Grabación del firehose
+  RECORD_FIREHOSE: envBool('RECORD_FIREHOSE', true),
 };
 
 // -----------------------------------------------------------
@@ -132,4 +159,10 @@ if (config.DYNAMIC_PRIORITY_FEE && config.MAX_PRIORITY_FEE_SOL < config.PRIORITY
 }
 if (config.ENTRY_OBSERVATION_SECONDS < 0 || config.ENTRY_OBSERVATION_SECONDS > 60) {
   throw new Error('[Config] ENTRY_OBSERVATION_SECONDS debe estar entre 0 y 60');
+}
+if (
+  config.PROFIT_SWEEP_THRESHOLD_SOL > 0 &&
+  config.PROFIT_SWEEP_KEEP_SOL >= config.PROFIT_SWEEP_THRESHOLD_SOL
+) {
+  throw new Error('[Config] PROFIT_SWEEP_KEEP_SOL debe ser menor que PROFIT_SWEEP_THRESHOLD_SOL');
 }

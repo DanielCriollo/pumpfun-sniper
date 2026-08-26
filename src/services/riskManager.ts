@@ -59,21 +59,40 @@ function saveStats(): void {
   }
 }
 
-/** Reinicia las métricas si cambió el día UTC */
+/** Reinicia las métricas si cambió el día UTC y emite el resumen del día */
 function rolloverIfNeeded(): void {
   if (stats.date === todayUtc()) return;
+  const prev = { ...stats };
   logger.info(
     {
-      date: stats.date,
-      realizedPnlSol: stats.realizedPnlSol.toFixed(6),
-      trades: stats.trades,
-      wins: stats.wins,
-      losses: stats.losses,
+      date: prev.date,
+      realizedPnlSol: prev.realizedPnlSol.toFixed(6),
+      trades: prev.trades,
+      wins: prev.wins,
+      losses: prev.losses,
     },
     '📅 Cierre de día — reiniciando métricas diarias',
   );
   stats = freshStats();
   saveStats();
+
+  // Resumen diario hacia n8n (→ Telegram/email) — solo si hubo actividad
+  if (prev.trades > 0) {
+    void sendWebhook({
+      event: 'DAILY_SUMMARY',
+      mint: 'SYSTEM',
+      realizedPnlSol: parseFloat(prev.realizedPnlSol.toFixed(6)),
+      timestamp: Date.now(),
+      extra: {
+        date: prev.date,
+        trades: prev.trades,
+        wins: prev.wins,
+        losses: prev.losses,
+        winRate: prev.trades > 0 ? parseFloat(((prev.wins / prev.trades) * 100).toFixed(1)) : 0,
+        breakerTripped: prev.breakerTripped,
+      },
+    });
+  }
 }
 
 export function initRiskManager(): void {

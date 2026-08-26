@@ -114,6 +114,7 @@ server.get('/api/status', async (_request, reply) => {
   const body: ApiResponse = {
     success: true,
     data: {
+      mode: config.DRY_RUN ? 'DRY_RUN' : 'REAL',
       isPaused: state.isPaused,
       wsConnected: state.wsInstance !== null,
       daily: {

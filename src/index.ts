@@ -15,8 +15,10 @@ import {
   registerTokenCreation,
   checkCreatorLocal,
   checkCreatorHistory,
+  checkHolderConcentration,
   pruneCreatorRegistry,
 } from './services/filters';
+import { recordFirehose, startRecorder } from './services/recorder';
 import { buyToken, BuyResult } from './services/pumpfun';
 import {
   addPosition,
@@ -34,7 +36,7 @@ import {
 import { initRiskManager } from './services/riskManager';
 import { sendWebhook } from './services/webhook';
 import { startServer } from './server';
-import { getSolBalance } from './services/solana';
+import { getSolBalance, sweepProfits } from './services/solana';
 import { NewTokenEvent, TradeEvent, Position } from './types';
 
 // -----------------------------------------------------------
@@ -192,6 +194,25 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
       );
     }
 
+    // Concentración de holders — post-observación, cuando ya hay holders reales
+    const holderCheck = await checkHolderConcentration(event.mint);
+    if (!holderCheck.passed) {
+      logger.info(
+        { mint: event.mint, reason: holderCheck.reason },
+        '🚫 Filtro RECHAZADO [holderConcentration]',
+      );
+      await sendWebhook({
+        event: 'FILTER_REJECTED',
+        mint: event.mint,
+        name: event.name,
+        symbol: event.symbol,
+        marketCapSol: obsResult?.finalMcap ?? event.marketCapSol,
+        filterReason: holderCheck.reason,
+        timestamp: Date.now(),
+      });
+      return;
+    }
+
     // Verificar balance descontando el SOL ya comprometido en otras compras
     const solBalance = await getSolBalance();
     const availableSol = solBalance - reservedSol;
@@ -215,7 +236,12 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
     reservedSol += buyAmount;
     let buyResult: BuyResult;
     try {
-      buyResult = await buyToken(event.mint, buyAmount);
+      // El mcap observado alimenta la simulación del fill en DRY_RUN
+      buyResult = await buyToken(
+        event.mint,
+        buyAmount,
+        obsResult?.finalMcap ?? event.marketCapSol,
+      );
     } finally {
       reservedSol -= buyAmount;
     }
@@ -260,6 +286,19 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
       bondingCurveKey: event.bondingCurveKey,
       creator: event.traderPublicKey,
       trades: [tradeRecord],
+      // Condiciones de entrada — se archivan con el PnL para el análisis
+      // posterior de qué configuraciones ganan dinero de verdad
+      entryContext: {
+        observationSec: config.ENTRY_OBSERVATION_SECONDS,
+        uniqueBuyers: obsResult?.uniqueBuyers,
+        buyCount: obsResult?.buyCount,
+        sellCount: obsResult?.sellCount,
+        devBuyPercent: (event.tokenAmount / config.PUMP_TOTAL_SUPPLY) * 100,
+        devSolAmount: event.solAmount,
+        createMcapSol: event.marketCapSol,
+        entryMcapSol: entryMcap,
+        hourUtc: new Date().getUTCHours(),
+      },
     };
 
     addPosition(position);
@@ -328,6 +367,8 @@ function onWsMessage(data: WebSocket.RawData): void {
 
   if (txType === 'create') {
     const event = parsed as unknown as NewTokenEvent;
+    // Dataset para backtesting: grabar TODOS los create
+    recordFirehose('create', parsed);
     // Inteligencia de creadores: registrar TODOS los create, se compre o no
     registerTokenCreation(event.traderPublicKey);
     // Usar void + IIFE para manejar la promesa sin bloquear el event loop
@@ -341,7 +382,12 @@ function onWsMessage(data: WebSocket.RawData): void {
   } else if (txType === 'buy' || txType === 'sell') {
     const event = parsed as unknown as TradeEvent;
     // Los mints bajo observación consumen el evento aquí
-    if (handleObservationTrade(event)) return;
+    const underObservation = handleObservationTrade(event);
+    // Grabar los trades de mints observados o con posición (backtesting)
+    if (underObservation || hasActivePosition(event.mint)) {
+      recordFirehose('trade', parsed);
+    }
+    if (underObservation) return;
     void (async () => {
       try {
         await handleTradeEvent(event);
@@ -471,6 +517,23 @@ function startMaintenance(): void {
     }
     pruneCreatorRegistry();
   }, 60_000);
+
+  // Barrido de ganancias a wallet fría — cada 10 min (desactivado por defecto;
+  // requiere PROFIT_SWEEP_ADDRESS y PROFIT_SWEEP_THRESHOLD_SOL en .env)
+  setInterval(() => {
+    void (async () => {
+      const swept = await sweepProfits();
+      if (swept) {
+        await sendWebhook({
+          event: 'PROFIT_SWEPT',
+          mint: 'SYSTEM',
+          solAmount: parseFloat(swept.amountSol.toFixed(6)),
+          signature: swept.signature,
+          timestamp: Date.now(),
+        });
+      }
+    })();
+  }, 10 * 60_000);
 }
 
 // -----------------------------------------------------------
@@ -514,13 +577,20 @@ function setupGracefulShutdown(): void {
 // -----------------------------------------------------------
 
 async function main(): Promise<void> {
-  logger.info('🚀 Iniciando PumpFun Sniper Bot');
+  logger.info(
+    config.DRY_RUN
+      ? '🚀 Iniciando PumpFun Sniper Bot — 🧪 MODO DRY RUN (paper trading, sin dinero real)'
+      : '🚀 Iniciando PumpFun Sniper Bot',
+  );
 
   // Montar manejadores de señales
   setupGracefulShutdown();
 
   // Cargar métricas diarias y circuit breaker
   initRiskManager();
+
+  // Grabador de firehose para backtesting offline
+  startRecorder();
 
   // Iniciar API interna (Fastify)
   await startServer();
@@ -540,6 +610,7 @@ async function main(): Promise<void> {
 
   logger.info(
     {
+      mode: config.DRY_RUN ? `DRY RUN (balance virtual ${config.DRY_RUN_START_BALANCE_SOL} SOL)` : 'REAL',
       buyMode: config.DYNAMIC_BUY_PERCENT > 0 ? `${config.DYNAMIC_BUY_PERCENT}% del balance` : `${config.BUY_AMOUNT_SOL} SOL fijo`,
       entryMode:
         config.ENTRY_OBSERVATION_SECONDS > 0

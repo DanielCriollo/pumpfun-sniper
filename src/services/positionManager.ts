@@ -3,7 +3,7 @@ import nodePath from 'path';
 import { config } from '../config';
 import { logger } from '../logger';
 import { Position, TradeEvent, TradeRecord, WebhookEvent } from '../types';
-import { sellToken } from './pumpfun';
+import { sellToken, SellResult } from './pumpfun';
 import { getTokenDisplayBalance, reclaimAtaRent, wallet } from './solana';
 import { subscribeToMintTrades, unsubscribeMintTrades } from '../state';
 import { PublicKey } from '@solana/web3.js';
@@ -29,6 +29,20 @@ const sellLocks = new Set<string>();
  *  y no confundirlas con ventas externas (Phantom) */
 const ownSellSignatures = new Set<string>();
 const OWN_SIG_TTL_MS = 5 * 60_000;
+
+/** Timestamps de trades recientes por mint — detección de muerte de volumen */
+const tradeTimes = new Map<string, number[]>();
+
+/** Escalado de slippage en salidas defensivas: si la venta falla mientras
+ *  el precio se derrumba, salir importa más que el precio */
+const ESCALATION_SLIPPAGES = [25, 50, 99];
+const DEFENSIVE_EVENTS: WebhookEvent[] = [
+  'SL_TRIGGERED',
+  'DEV_SELL_EXIT',
+  'POSITION_CLOSED_TIME_EXPIRED',
+  'VOLUME_DEATH_EXIT',
+  'PANIC_SELL',
+];
 
 const DATA_DIR = nodePath.join(process.cwd(), 'data');
 const POSITIONS_FILE = nodePath.join(DATA_DIR, 'positions.json');
@@ -172,6 +186,7 @@ function closePosition(position: Position): number {
   const realized = (position.solReceived ?? 0) - position.solSpent;
   position.realizedPnlSol = realized;
 
+  tradeTimes.delete(position.mint);
   unsubscribeMintTrades(position.mint);
   appendToHistory(position);
   positions.delete(position.mint);
@@ -203,6 +218,15 @@ export async function processTradeEvent(event: TradeEvent): Promise<void> {
 
   // Actualizar market cap en tiempo real
   position.currentMarketCapSol = event.marketCapSol;
+
+  // Registrar actividad para la detección de muerte de volumen
+  if (config.VOLUME_EXIT_MIN_TRADES > 0) {
+    const times = tradeTimes.get(event.mint) ?? [];
+    times.push(Date.now());
+    // Mantener solo lo relevante para la ventana (x2 de margen)
+    const cutoff = Date.now() - config.VOLUME_EXIT_WINDOW_SEC * 2000;
+    tradeTimes.set(event.mint, times.filter((t) => t >= cutoff));
+  }
 
   const isOwnWallet = event.traderPublicKey === wallet.publicKey.toBase58();
 
@@ -480,7 +504,34 @@ async function executeSell(
   );
 
   try {
-    const result = await sellToken(position.mint, tokenAmount);
+    // Salidas defensivas: si la venta falla (el precio cae más rápido que el
+    // slippage), reintentar escalando slippage — salir importa más que el precio
+    const isDefensive = DEFENSIVE_EVENTS.includes(event);
+    let result: SellResult | null = null;
+    let lastError: unknown = null;
+    const slippagePlan = isDefensive
+      ? [config.SLIPPAGE_PERCENT, ...ESCALATION_SLIPPAGES.filter((s) => s > config.SLIPPAGE_PERCENT)]
+      : [config.SLIPPAGE_PERCENT];
+
+    for (const slippage of slippagePlan) {
+      try {
+        result = await sellToken(position.mint, tokenAmount, {
+          slippagePercent: slippage,
+          simMcapSol: position.currentMarketCapSol,
+        });
+        break;
+      } catch (err) {
+        lastError = err;
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(
+          { mint: position.mint, slippage, err: msg },
+          isDefensive
+            ? '⚠️  Venta defensiva fallida — escalando slippage'
+            : '⚠️  Venta fallida',
+        );
+      }
+    }
+    if (!result) throw lastError;
 
     // Registrar la firma propia para ignorar su eco en el WS
     ownSellSignatures.add(result.signature);
@@ -616,6 +667,7 @@ const MONITOR_INTERVAL_MS = 10_000;
 
 /** Reintenta leer el balance real de posiciones registradas con balance 0 */
 async function recoverMissingBalance(position: Position): Promise<void> {
+  if (config.DRY_RUN) return; // en paper trading el balance simulado siempre existe
   try {
     const bal = await getTokenDisplayBalance(new PublicKey(position.mint));
     if (bal < 1) return;
@@ -660,8 +712,38 @@ async function monitorTick(): Promise<void> {
       if (position.status !== 'ACTIVE' || sellLocks.has(position.mint)) continue;
     }
 
-    // 3. Cierre por tiempo máximo (posición zombie)
     const holdMs = now - position.entryTimestamp;
+
+    // 3. Muerte de volumen: si nadie tradea el token, el momentum murió —
+    //    salir ya (aunque se esté en verde), porque la liquidez se evapora
+    if (
+      config.VOLUME_EXIT_MIN_TRADES > 0 &&
+      position.tokenBalance >= 1 &&
+      holdMs > Math.max(60_000, config.VOLUME_EXIT_WINDOW_SEC * 1000)
+    ) {
+      const cutoff = now - config.VOLUME_EXIT_WINDOW_SEC * 1000;
+      const recentTrades = (tradeTimes.get(position.mint) ?? []).filter((t) => t >= cutoff);
+      if (recentTrades.length < config.VOLUME_EXIT_MIN_TRADES) {
+        logger.warn(
+          {
+            mint: position.mint,
+            symbol: position.symbol,
+            tradesInWindow: recentTrades.length,
+            windowSec: config.VOLUME_EXIT_WINDOW_SEC,
+          },
+          '📉 Volumen muerto — saliendo de la posición',
+        );
+        await executeSell(
+          position,
+          position.tokenBalance,
+          'VOLUME_DEATH_EXIT',
+          `Solo ${recentTrades.length} trades en ${config.VOLUME_EXIT_WINDOW_SEC}s (mín. ${config.VOLUME_EXIT_MIN_TRADES}) — momentum muerto`,
+        );
+        continue;
+      }
+    }
+
+    // 4. Cierre por tiempo máximo (posición zombie)
     if (holdMs < maxMs) continue;
 
     const holdMin = (holdMs / 60_000).toFixed(1);

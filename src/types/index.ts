@@ -84,6 +84,28 @@ export interface Config {
   DYNAMIC_PRIORITY_FEE: boolean;      // calcular priority fee según congestión de red
   MAX_PRIORITY_FEE_SOL: number;       // techo del fee dinámico
   SKIP_PREFLIGHT: boolean;            // true = más rápido, sin simulación previa
+
+  // Paper trading — simula compras/ventas con precios reales del stream
+  DRY_RUN: boolean;
+  DRY_RUN_START_BALANCE_SOL: number;  // balance virtual inicial en modo DRY_RUN
+
+  // Salida por muerte de volumen (0 en MIN_TRADES = desactivado)
+  VOLUME_EXIT_WINDOW_SEC: number;     // ventana de conteo de trades
+  VOLUME_EXIT_MIN_TRADES: number;     // salir si hay menos trades que esto en la ventana
+
+  // RPC de respaldo ('' = desactivado)
+  RPC_FALLBACK_ENDPOINT: string;
+
+  // Concentración de holders (0 = desactivado)
+  MAX_HOLDER_PERCENT: number;         // rechazar si un holder (no curve) tiene > X% del supply
+
+  // Barrido de ganancias a wallet fría ('' o 0 = desactivado)
+  PROFIT_SWEEP_ADDRESS: string;
+  PROFIT_SWEEP_THRESHOLD_SOL: number; // barrer cuando el balance supere esto
+  PROFIT_SWEEP_KEEP_SOL: number;      // SOL que se queda como capital de trabajo
+
+  // Grabación del firehose para backtesting offline
+  RECORD_FIREHOSE: boolean;
 }
 
 // -----------------------------------------------------------
@@ -138,6 +160,24 @@ export interface TradeRecord {
   reason: string;
 }
 
+/**
+ * Condiciones bajo las que se abrió la posición — se archiva junto al
+ * PnL en el historial para poder analizar qué condiciones ganan dinero.
+ */
+export interface EntryContext {
+  observationSec: number;
+  uniqueBuyers?: number;
+  buyCount?: number;
+  sellCount?: number;
+  devBuyPercent: number;
+  devSolAmount: number;
+  /** Mcap en el evento create */
+  createMcapSol: number;
+  /** Mcap real de entrada (calculado del fill) */
+  entryMcapSol: number;
+  hourUtc: number;
+}
+
 export interface Position {
   mint: string;
   name: string;
@@ -170,6 +210,8 @@ export interface Position {
   solReceived?: number;
   /** PnL realizado en SOL al cerrar (solReceived - solSpent) */
   realizedPnlSol?: number;
+  /** Condiciones de entrada — para el análisis posterior de qué funciona */
+  entryContext?: EntryContext;
 
   // ------- Trailing Stop Loss (inicializado por addPosition) -------
   /** Máximo market cap visto desde la apertura */
@@ -196,7 +238,10 @@ export type WebhookEvent =
   | 'POSITION_CLOSED_TIME_EXPIRED'
   | 'POSITION_CLOSED_EXTERNAL'
   | 'DEV_SELL_EXIT'
-  | 'CIRCUIT_BREAKER_TRIGGERED';
+  | 'CIRCUIT_BREAKER_TRIGGERED'
+  | 'VOLUME_DEATH_EXIT'
+  | 'DAILY_SUMMARY'
+  | 'PROFIT_SWEPT';
 
 export interface WebhookPayload {
   event: WebhookEvent;
@@ -213,6 +258,8 @@ export interface WebhookPayload {
   realizedPnlSol?: number;   // PnL REAL en SOL (SOL recibido - SOL gastado)
   timestamp: number;
   position?: Partial<Position>;
+  /** Datos adicionales del evento (resumen diario, sweep, etc.) */
+  extra?: Record<string, unknown>;
 }
 
 // -----------------------------------------------------------
