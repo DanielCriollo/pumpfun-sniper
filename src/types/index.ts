@@ -163,7 +163,8 @@ export type WebhookEvent =
   | 'PANIC_SELL'
   | 'TRADE_ERROR'
   | 'FILTER_REJECTED'
-  | 'POSITION_CLOSED_TIME_EXPIRED';
+  | 'POSITION_CLOSED_TIME_EXPIRED'
+  | 'POSITION_CLOSED_EXTERNAL';
 
 export interface WebhookPayload {
   event: WebhookEvent;

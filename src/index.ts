@@ -12,6 +12,7 @@ import { applyFilters } from './services/filters';
 import { buyToken } from './services/pumpfun';
 import {
   addPosition,
+  initPositionManager,
   startPositionMonitor,
   processTradeEvent,
   getActivePositionCount,
@@ -355,6 +356,9 @@ async function main(): Promise<void> {
 
   // Iniciar API interna (Fastify)
   await startServer();
+
+  // Cargar posiciones persistidas y re-suscribir mints activos
+  initPositionManager();
 
   // Iniciar monitor de posiciones zombie (time-based exit)
   startPositionMonitor();

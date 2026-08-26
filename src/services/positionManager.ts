@@ -1,26 +1,86 @@
+import fs from 'fs';
+import nodePath from 'path';
 import { config } from '../config';
 import { logger } from '../logger';
 import { Position, TradeEvent, TradeRecord, WebhookEvent } from '../types';
 import { sellToken } from './pumpfun';
-import { reclaimAtaRent } from './solana';
+import { reclaimAtaRent, wallet } from './solana';
+import { subscribeToMintTrades } from '../state';
 import { PublicKey } from '@solana/web3.js';
 import { sendWebhook } from './webhook';
 
 // -----------------------------------------------------------
 // Gestor Algorítmico de Posiciones — Módulo C
 // Incluye: TP% basado en ganancia, Trailing SL con HWM,
-//          y salida automática por tiempo (posiciones zombie).
+//          salida automática por tiempo, persistencia en disco,
+//          y detección de ventas externas (Phantom).
 // -----------------------------------------------------------
 
 /** Mapa mint → Position (fuente de verdad en memoria) */
 const positions = new Map<string, Position>();
 
-/**
- * Set de mints en proceso de venta activo.
- * Evita que dos eventos de trade simultáneos disparen
- * una doble venta para la misma posición.
- */
+/** Set de mints en proceso de venta activo — evita doble venta concurrente */
 const sellLocks = new Set<string>();
+
+/** Ruta del archivo de persistencia */
+const POSITIONS_FILE = nodePath.join(process.cwd(), 'data', 'positions.json');
+
+// -----------------------------------------------------------
+// Persistencia en disco
+// -----------------------------------------------------------
+
+function savePositions(): void {
+  try {
+    const dir = nodePath.dirname(POSITIONS_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const data = JSON.stringify(Array.from(positions.values()), null, 2);
+    fs.writeFileSync(POSITIONS_FILE, data, 'utf8');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn({ err: msg }, '⚠️  No se pudo guardar positions.json');
+  }
+}
+
+function loadPositions(): void {
+  try {
+    if (!fs.existsSync(POSITIONS_FILE)) return;
+    const raw = fs.readFileSync(POSITIONS_FILE, 'utf8');
+    const arr = JSON.parse(raw) as Position[];
+    for (const pos of arr) {
+      positions.set(pos.mint, pos);
+    }
+    const active = arr.filter((p) => p.status === 'ACTIVE').length;
+    logger.info(
+      { loaded: arr.length, active },
+      '💾 Posiciones cargadas desde disco',
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn({ err: msg }, '⚠️  No se pudo leer positions.json — empezando desde cero');
+  }
+}
+
+/**
+ * Inicializa el gestor: carga posiciones persistidas y re-suscribe
+ * a los mints de posiciones activas para seguir monitoreando TP/SL.
+ * Llamar una sola vez desde main() antes de conectar el WebSocket.
+ */
+export function initPositionManager(): void {
+  loadPositions();
+  let resubscribed = 0;
+  for (const pos of positions.values()) {
+    if (pos.status === 'ACTIVE') {
+      subscribeToMintTrades(pos.mint);
+      resubscribed++;
+    }
+  }
+  if (resubscribed > 0) {
+    logger.info(
+      { resubscribed },
+      '🔄 Re-suscrito a mints de posiciones activas tras reinicio',
+    );
+  }
+}
 
 // -----------------------------------------------------------
 // Lectura de posiciones
@@ -52,15 +112,15 @@ export function hasActivePosition(mint: string): boolean {
 // -----------------------------------------------------------
 
 export function addPosition(position: Position): void {
-  // Inicializar estado del trailing SL
   position.highWaterMarkMcap = position.entryMarketCapSol;
   position.breakevenActive = false;
   position.trailingSLActive = false;
-  // SL inicial: entry * (1 - SL_PERCENT / 100)
   position.effectiveSLThreshold =
     position.entryMarketCapSol * (1 - config.SL_PERCENT / 100);
 
   positions.set(position.mint, position);
+  savePositions();
+
   logger.info(
     {
       mint: position.mint,
@@ -80,7 +140,7 @@ export function addPosition(position: Position): void {
 
 /**
  * Actualiza el market cap actual de la posición y evalúa TP/SL.
- * Llamado cada vez que llega un TradeEvent del WebSocket.
+ * También detecta ventas realizadas externamente (Phantom u otro wallet).
  */
 export async function processTradeEvent(event: TradeEvent): Promise<void> {
   const position = positions.get(event.mint);
@@ -88,6 +148,72 @@ export async function processTradeEvent(event: TradeEvent): Promise<void> {
 
   // Actualizar market cap en tiempo real
   position.currentMarketCapSol = event.marketCapSol;
+
+  // -----------------------------------------------------------------
+  // Detección de venta externa (Phantom / manual)
+  // Si nuestra wallet vendió este token sin que el bot lo ejecutara,
+  // sincronizamos el balance y cerramos la posición si es necesario.
+  // -----------------------------------------------------------------
+  if (
+    event.txType === 'sell' &&
+    event.traderPublicKey === wallet.publicKey.toBase58()
+  ) {
+    const prevBalance = position.tokenBalance;
+    const newBalance = event.newTokenBalance ?? 0;
+    position.tokenBalance = newBalance;
+
+    logger.info(
+      {
+        mint: event.mint,
+        symbol: position.symbol,
+        prevBalance,
+        newBalance,
+      },
+      '📱 Venta externa detectada (Phantom/manual)',
+    );
+
+    if (newBalance < 1) {
+      position.status = 'CLOSED';
+      position.tokenBalance = 0;
+      void reclaimAtaRent(new PublicKey(position.mint));
+
+      const pnlPercent =
+        ((position.currentMarketCapSol - position.entryMarketCapSol) /
+          position.entryMarketCapSol) *
+        100;
+
+      logger.info(
+        {
+          mint: event.mint,
+          symbol: position.symbol,
+          pnlPercent: pnlPercent.toFixed(2) + '%',
+        },
+        '✅ Posición cerrada por venta externa',
+      );
+
+      savePositions();
+
+      await sendWebhook({
+        event: 'POSITION_CLOSED_EXTERNAL',
+        mint: position.mint,
+        name: position.name,
+        symbol: position.symbol,
+        marketCapSol: position.currentMarketCapSol,
+        pnlPercent: parseFloat(pnlPercent.toFixed(2)),
+        timestamp: Date.now(),
+        position: {
+          entryMarketCapSol: position.entryMarketCapSol,
+          currentMarketCapSol: position.currentMarketCapSol,
+          tokenBalance: 0,
+          status: 'CLOSED',
+        },
+      });
+    } else {
+      // Venta parcial desde Phantom — actualizar balance y guardar
+      savePositions();
+    }
+    return; // No evaluar TP/SL para trades externos
+  }
 
   // Actualizar High Water Mark y recalcular trailing SL
   updateTrailingSLPhases(position);
@@ -100,22 +226,11 @@ export async function processTradeEvent(event: TradeEvent): Promise<void> {
 // Trailing Stop Loss — actualización de fases y HWM
 // -----------------------------------------------------------
 
-/**
- * Recalcula el effectiveSLThreshold según la fase actual:
- *
- *  Fase 0 (inicial):   SL fijo = entry * (1 - SL_PERCENT%)
- *  Fase 1 (breakeven): Si gain >= TRAILING_SL_BREAKEVEN_PERCENT%
- *                      → SL sube a entry (sin pérdida)
- *  Fase 2 (trailing):  Si gain >= TRAILING_SL_ACTIVATE_PERCENT%
- *                      → SL = HWM * (1 - TRAILING_SL_DISTANCE_PERCENT%)
- *                         y se actualiza con cada nuevo HWM
- */
 function updateTrailingSLPhases(position: Position): void {
   const entry = position.entryMarketCapSol;
   const current = position.currentMarketCapSol;
   const gainPercent = ((current - entry) / entry) * 100;
 
-  // Actualizar HWM si el precio está subiendo
   if (current > (position.highWaterMarkMcap ?? entry)) {
     position.highWaterMarkMcap = current;
   }
@@ -123,11 +238,9 @@ function updateTrailingSLPhases(position: Position): void {
   const hwm = position.highWaterMarkMcap ?? entry;
 
   if (gainPercent >= config.TRAILING_SL_ACTIVATE_PERCENT) {
-    // Fase 2: trailing SL activo — seguir el HWM hacia arriba
     position.trailingSLActive = true;
     position.breakevenActive = true;
     const trailThreshold = hwm * (1 - config.TRAILING_SL_DISTANCE_PERCENT / 100);
-    // El trailing SL solo sube, nunca baja
     if (
       position.effectiveSLThreshold === undefined ||
       trailThreshold > position.effectiveSLThreshold
@@ -144,10 +257,9 @@ function updateTrailingSLPhases(position: Position): void {
       );
     }
   } else if (gainPercent >= config.TRAILING_SL_BREAKEVEN_PERCENT) {
-    // Fase 1: SL sube a breakeven (entry)
     if (!position.breakevenActive) {
       position.breakevenActive = true;
-      position.effectiveSLThreshold = entry; // SL = precio de entrada
+      position.effectiveSLThreshold = entry;
       logger.info(
         {
           mint: position.mint,
@@ -158,7 +270,6 @@ function updateTrailingSLPhases(position: Position): void {
       );
     }
   }
-  // Si gain < TRAILING_SL_BREAKEVEN_PERCENT: mantener SL fijo inicial
 }
 
 // -----------------------------------------------------------
@@ -166,18 +277,15 @@ function updateTrailingSLPhases(position: Position): void {
 // -----------------------------------------------------------
 
 async function evaluateTpSl(position: Position): Promise<void> {
-  // Bloqueo para evitar ventas concurrentes
   if (sellLocks.has(position.mint)) return;
 
   const entry = position.entryMarketCapSol;
   const current = position.currentMarketCapSol;
   const gainPercent = ((current - entry) / entry) * 100;
 
-  // Umbral de SL efectivo (puede ser fijo, breakeven o trailing)
   const slThreshold =
     position.effectiveSLThreshold ?? entry * (1 - config.SL_PERCENT / 100);
 
-  // ----- Stop Loss (máxima prioridad) -----
   if (current <= slThreshold) {
     const slLabel = position.trailingSLActive
       ? 'Trailing SL'
@@ -193,7 +301,6 @@ async function evaluateTpSl(position: Position): Promise<void> {
     return;
   }
 
-  // ----- TP2 (antes que TP1 si ambos se disparan a la vez) -----
   if (!position.tp2Hit && gainPercent >= config.TP2_PERCENT) {
     const sellAmount = Math.floor(
       position.initialTokenBalance * (config.TP2_SELL_PERCENT / 100),
@@ -209,7 +316,6 @@ async function evaluateTpSl(position: Position): Promise<void> {
     return;
   }
 
-  // ----- TP1 -----
   if (!position.tp1Hit && gainPercent >= config.TP1_PERCENT) {
     const sellAmount = Math.floor(
       position.initialTokenBalance * (config.TP1_SELL_PERCENT / 100),
@@ -227,7 +333,7 @@ async function evaluateTpSl(position: Position): Promise<void> {
 }
 
 // -----------------------------------------------------------
-// Ejecutor de ventas (todas las salidas pasan por aquí)
+// Ejecutor de ventas (todas las salidas del bot pasan por aquí)
 // -----------------------------------------------------------
 
 async function executeSell(
@@ -256,13 +362,11 @@ async function executeSell(
   try {
     const result = await sellToken(position.mint, tokenAmount);
 
-    // Calcular PnL estimado en %
     const pnlPercent =
       ((position.currentMarketCapSol - position.entryMarketCapSol) /
         position.entryMarketCapSol) *
       100;
 
-    // Registrar el trade
     const record: TradeRecord = {
       timestamp: Date.now(),
       action: 'SELL',
@@ -274,7 +378,6 @@ async function executeSell(
     };
     position.trades.push(record);
 
-    // Actualizar balance y flags
     position.tokenBalance = Math.max(0, position.tokenBalance - tokenAmount);
 
     if (event === 'TP1_TRIGGERED') {
@@ -282,18 +385,17 @@ async function executeSell(
     } else if (event === 'TP2_TRIGGERED') {
       position.tp2Hit = true;
     } else {
-      // SL, Panic o Time Expired: cerrar posición
       position.status = 'CLOSED';
       position.tokenBalance = 0;
-      // Reclamar rent de la ATA vacía (fire-and-forget)
       void reclaimAtaRent(new PublicKey(position.mint));
     }
 
-    // Si tras la venta no queda balance relevante (dust), cerrar
     if (position.tokenBalance < 1) {
       position.status = 'CLOSED';
       void reclaimAtaRent(new PublicKey(position.mint));
     }
+
+    savePositions();
 
     logger.info(
       {
@@ -306,7 +408,6 @@ async function executeSell(
       `✅ ${event} ejecutado`,
     );
 
-    // Notificar a n8n
     await sendWebhook({
       event,
       mint: position.mint,
@@ -329,7 +430,6 @@ async function executeSell(
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     logger.error({ mint: position.mint, event, err: errMsg }, `Error en ${event}`);
-
     await sendWebhook({
       event: 'TRADE_ERROR',
       mint: position.mint,
@@ -358,31 +458,19 @@ export async function executePanicSell(mint: string): Promise<void> {
   if (position.tokenBalance < 1) {
     throw new Error(`Balance insuficiente para vender: ${position.tokenBalance}`);
   }
-
-  await executeSell(
-    position,
-    position.tokenBalance,
-    'PANIC_SELL',
-    'Panic sell manual',
-  );
+  await executeSell(position, position.tokenBalance, 'PANIC_SELL', 'Panic sell manual');
 }
 
 // -----------------------------------------------------------
 // Monitor de tiempo — cierre automático de posiciones zombie
 // -----------------------------------------------------------
 
-/**
- * Inicia un setInterval que revisa cada 60 segundos si alguna
- * posición activa lleva más de MAX_POSITION_HOLD_TIME_MINUTES.
- * Llamar una sola vez desde main().
- */
 export function startPositionMonitor(): void {
   const intervalMs = 60_000;
   const maxMs = config.MAX_HOLD_MINUTES * 60_000;
 
   setInterval(() => {
     const now = Date.now();
-
     for (const position of positions.values()) {
       if (position.status !== 'ACTIVE') continue;
       if (sellLocks.has(position.mint)) continue;
@@ -412,10 +500,7 @@ export function startPositionMonitor(): void {
   }, intervalMs);
 
   logger.info(
-    {
-      checkIntervalMin: 1,
-      maxHoldMin: config.MAX_HOLD_MINUTES,
-    },
+    { checkIntervalMin: 1, maxHoldMin: config.MAX_HOLD_MINUTES },
     '⏱️  Monitor de tiempo de posiciones iniciado',
   );
 }
