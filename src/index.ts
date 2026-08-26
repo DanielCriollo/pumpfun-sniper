@@ -380,6 +380,13 @@ async function handleTradeEvent(event: TradeEvent): Promise<void> {
 // Manejo de mensajes WebSocket entrantes
 // -----------------------------------------------------------
 
+/** Contadores de tráfico WS — diagnóstico de suscripciones */
+const wsTraffic = { creates: 0, trades: 0, other: 0 };
+/** Cuántos mensajes "desconocidos" se han loggeado (las respuestas de
+ *  PumpPortal a las suscripciones llegan por aquí — confirmaciones o errores) */
+let unknownMsgsLogged = 0;
+const MAX_UNKNOWN_MSGS_LOGGED = 20;
+
 function onWsMessage(data: WebSocket.RawData): void {
   markWsMessage();
 
@@ -394,6 +401,7 @@ function onWsMessage(data: WebSocket.RawData): void {
   const txType = parsed['txType'];
 
   if (txType === 'create') {
+    wsTraffic.creates++;
     const event = parsed as unknown as NewTokenEvent;
     // Eventos malformados (sin mint o sin creador) — ignorar
     if (typeof event.mint !== 'string' || typeof event.traderPublicKey !== 'string') return;
@@ -410,14 +418,12 @@ function onWsMessage(data: WebSocket.RawData): void {
       }
     })();
   } else if (txType === 'buy' || txType === 'sell') {
+    wsTraffic.trades++;
     const event = parsed as unknown as TradeEvent;
+    // Grabar TODOS los trades que llegan (solo llegan de mints suscritos)
+    recordFirehose('trade', parsed);
     // Los mints bajo observación consumen el evento aquí
-    const underObservation = handleObservationTrade(event);
-    // Grabar los trades de mints observados o con posición (backtesting)
-    if (underObservation || hasActivePosition(event.mint)) {
-      recordFirehose('trade', parsed);
-    }
-    if (underObservation) return;
+    if (handleObservationTrade(event)) return;
     void (async () => {
       try {
         await handleTradeEvent(event);
@@ -425,8 +431,19 @@ function onWsMessage(data: WebSocket.RawData): void {
         logger.error({ err }, 'Error no capturado en handleTradeEvent');
       }
     })();
+  } else {
+    // Respuestas de PumpPortal (acks de suscripción, errores, avisos).
+    // Loggear los primeros: si las suscripciones a trades fallan,
+    // la razón aparece exactamente aquí.
+    wsTraffic.other++;
+    if (unknownMsgsLogged < MAX_UNKNOWN_MSGS_LOGGED) {
+      unknownMsgsLogged++;
+      logger.info(
+        { raw: JSON.stringify(parsed).slice(0, 400) },
+        '📩 Mensaje WS sin txType (ack/error de PumpPortal)',
+      );
+    }
   }
-  // Ignorar mensajes de tipo desconocido (pings, acks, etc.)
 }
 
 // -----------------------------------------------------------
@@ -546,6 +563,16 @@ function startMaintenance(): void {
       if (now - ts > SYMBOL_COOLDOWN_MS) recentSymbolBuys.delete(symbol);
     }
     pruneCreatorRegistry();
+
+    // Pulso de tráfico WS del último minuto — si trades=0 con tokens
+    // en observación, la suscripción a trades no está funcionando
+    logger.info(
+      { ...wsTraffic },
+      '📈 Tráfico WS último minuto (creates/trades/other)',
+    );
+    wsTraffic.creates = 0;
+    wsTraffic.trades = 0;
+    wsTraffic.other = 0;
   }, 60_000);
 
   // Barrido de ganancias a wallet fría — cada 10 min (desactivado por defecto;
