@@ -57,7 +57,7 @@ export async function getTokenDisplayBalance(mint: PublicKey): Promise<number> {
     const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
     const account = await getAccount(connection, ata, 'confirmed');
     const raw = account.amount; // bigint
-    return Number(raw / BigInt(10 ** PUMP_TOKEN_DECIMALS));
+    return Number(raw) / 10 ** PUMP_TOKEN_DECIMALS;
   } catch (err) {
     if (err instanceof TokenAccountNotFoundError) {
       return 0;
@@ -79,6 +79,36 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Espera la confirmación de una firma haciendo polling de
+ * getSignatureStatuses. Evita el problema de confirmar con un
+ * blockhash distinto al de la transacción enviada.
+ */
+export async function confirmSignature(
+  signature: string,
+  timeoutMs = 45_000,
+): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const status = (await connection.getSignatureStatuses([signature])).value[0];
+    if (status) {
+      if (status.err) {
+        throw new Error(
+          `Transaction failed on-chain: ${JSON.stringify(status.err)}`,
+        );
+      }
+      if (
+        status.confirmationStatus === 'confirmed' ||
+        status.confirmationStatus === 'finalized'
+      ) {
+        return;
+      }
+    }
+    await sleep(500);
+  }
+  throw new Error(`Timeout esperando confirmación de tx ${signature}`);
+}
+
+/**
  * Firma (si es necesario) y envía una transacción deserializada.
  * Reintenta hasta MAX_SEND_RETRIES veces ante errores transitorios.
  * Lanza error si supera el límite de intentos.
@@ -95,7 +125,7 @@ export async function signAndSendTransaction(
         const vtx = VersionedTransaction.deserialize(txBytes);
         vtx.sign([wallet]);
         signature = await connection.sendRawTransaction(vtx.serialize(), {
-          skipPreflight: false,
+          skipPreflight: config.SKIP_PREFLIGHT,
           preflightCommitment: 'confirmed',
           maxRetries: 3,
         });
@@ -104,28 +134,13 @@ export async function signAndSendTransaction(
         const tx = Transaction.from(Buffer.from(txBytes));
         tx.partialSign(wallet);
         signature = await connection.sendRawTransaction(tx.serialize(), {
-          skipPreflight: false,
+          skipPreflight: config.SKIP_PREFLIGHT,
           preflightCommitment: 'confirmed',
           maxRetries: 3,
         });
       }
 
-      // Esperar confirmación
-      const latestBlockhash = await connection.getLatestBlockhash('confirmed');
-      const result = await connection.confirmTransaction(
-        {
-          signature,
-          blockhash: latestBlockhash.blockhash,
-          lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-        },
-        'confirmed',
-      );
-
-      if (result.value.err) {
-        throw new Error(
-          `Transaction failed on-chain: ${JSON.stringify(result.value.err)}`,
-        );
-      }
+      await confirmSignature(signature);
 
       logger.debug({ signature, attempt }, 'Transacción confirmada');
       return signature;
@@ -151,6 +166,123 @@ export async function signAndSendTransaction(
 
   // TypeScript necesita este punto de retorno; nunca se alcanza
   throw new Error('Unreachable');
+}
+
+// -----------------------------------------------------------
+// Lectura de transacciones confirmadas — PnL y fills reales
+// -----------------------------------------------------------
+
+/** Obtiene la transacción parseada con reintentos (la RPC tarda en indexarla) */
+async function getParsedTx(
+  signature: string,
+  maxAttempts = 4,
+  delayMs = 800,
+): Promise<import('@solana/web3.js').ParsedTransactionWithMeta | null> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const tx = await connection.getParsedTransaction(signature, {
+      maxSupportedTransactionVersion: 0,
+      commitment: 'confirmed',
+    });
+    if (tx) return tx;
+    if (attempt < maxAttempts) await sleep(delayMs);
+  }
+  return null;
+}
+
+/**
+ * Delta REAL de SOL de nuestra wallet en una transacción confirmada
+ * (positivo en ventas, negativo en compras; incluye fees pagadas).
+ * Devuelve null si la tx no se pudo leer.
+ */
+export async function getWalletSolDeltaFromTx(
+  signature: string,
+): Promise<number | null> {
+  try {
+    const tx = await getParsedTx(signature);
+    if (!tx?.meta) return null;
+    const me = wallet.publicKey.toBase58();
+    const keys = tx.transaction.message.accountKeys;
+    let idx = keys.findIndex((k) => k.pubkey.toBase58() === me);
+    if (idx < 0) idx = 0; // fee payer somos nosotros siempre
+    return (tx.meta.postBalances[idx] - tx.meta.preBalances[idx]) / LAMPORTS_PER_SOL;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn({ signature, err: msg }, 'No se pudo leer delta SOL de la tx');
+    return null;
+  }
+}
+
+/**
+ * Tokens REALES recibidos/vendidos de `mint` por nuestra wallet en una tx
+ * confirmada (unidades display). Más fiable y rápido que esperar la
+ * propagación del ATA en la RPC. Devuelve null si no se pudo leer.
+ */
+export async function getTokenDeltaFromTx(
+  signature: string,
+  mint: string,
+): Promise<number | null> {
+  try {
+    const tx = await getParsedTx(signature);
+    if (!tx?.meta?.postTokenBalances) return null;
+    const me = wallet.publicKey.toBase58();
+    const post = tx.meta.postTokenBalances.find(
+      (b) => b.mint === mint && b.owner === me,
+    );
+    if (!post) return null;
+    const pre = tx.meta.preTokenBalances?.find(
+      (b) => b.mint === mint && b.owner === me,
+    );
+    return (post.uiTokenAmount.uiAmount ?? 0) - (pre?.uiTokenAmount.uiAmount ?? 0);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn({ signature, mint, err: msg }, 'No se pudo leer delta de tokens de la tx');
+    return null;
+  }
+}
+
+// -----------------------------------------------------------
+// Priority fee dinámico según congestión de red
+// -----------------------------------------------------------
+
+const PRIORITY_FEE_CACHE_MS = 30_000;
+const ASSUMED_COMPUTE_UNITS = 250_000; // CU típico de un trade en pump.fun
+
+let priorityFeeCache = { valueSol: 0, fetchedAt: 0 };
+
+/**
+ * Priority fee en SOL para el próximo trade. Si DYNAMIC_PRIORITY_FEE está
+ * activo, usa el percentil 75 de las fees recientes de la red (cacheado 30 s),
+ * acotado entre PRIORITY_FEE_SOL (suelo) y MAX_PRIORITY_FEE_SOL (techo).
+ */
+export async function getPriorityFeeSol(): Promise<number> {
+  if (!config.DYNAMIC_PRIORITY_FEE) return config.PRIORITY_FEE_SOL;
+
+  const now = Date.now();
+  if (now - priorityFeeCache.fetchedAt < PRIORITY_FEE_CACHE_MS && priorityFeeCache.valueSol > 0) {
+    return priorityFeeCache.valueSol;
+  }
+
+  try {
+    const fees = await connection.getRecentPrioritizationFees();
+    const values = fees
+      .map((f) => f.prioritizationFee)
+      .filter((v) => v > 0)
+      .sort((a, b) => a - b);
+    // microlamports por CU → SOL totales para ASSUMED_COMPUTE_UNITS
+    const p75 = values.length > 0 ? values[Math.floor(values.length * 0.75)] : 0;
+    const feeSol = (p75 * ASSUMED_COMPUTE_UNITS) / 1e6 / LAMPORTS_PER_SOL;
+    const clamped = Math.min(
+      Math.max(feeSol, config.PRIORITY_FEE_SOL),
+      config.MAX_PRIORITY_FEE_SOL,
+    );
+    priorityFeeCache = { valueSol: clamped, fetchedAt: now };
+    logger.debug({ p75MicroLamports: p75, feeSol: clamped }, 'Priority fee dinámico actualizado');
+    return clamped;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn({ err: msg }, 'Fallo leyendo fees recientes — usando fee base');
+    return config.PRIORITY_FEE_SOL;
+  }
 }
 
 // -----------------------------------------------------------

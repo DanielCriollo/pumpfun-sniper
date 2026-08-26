@@ -4,35 +4,47 @@ import { config } from '../config';
 import { logger } from '../logger';
 import { Position, TradeEvent, TradeRecord, WebhookEvent } from '../types';
 import { sellToken } from './pumpfun';
-import { reclaimAtaRent, wallet } from './solana';
-import { subscribeToMintTrades } from '../state';
+import { getTokenDisplayBalance, reclaimAtaRent, wallet } from './solana';
+import { subscribeToMintTrades, unsubscribeMintTrades } from '../state';
 import { PublicKey } from '@solana/web3.js';
 import { sendWebhook } from './webhook';
+import { recordClosedTrade } from './riskManager';
 
 // -----------------------------------------------------------
 // Gestor Algorítmico de Posiciones — Módulo C
 // Incluye: TP% basado en ganancia, Trailing SL con HWM,
-//          salida automática por tiempo, persistencia en disco,
-//          y detección de ventas externas (Phantom).
+//          salida por tiempo y por dev-sell, PnL realizado REAL,
+//          persistencia en disco + historial, y detección de
+//          ventas externas (Phantom).
 // -----------------------------------------------------------
 
-/** Mapa mint → Position (fuente de verdad en memoria) */
+/** Mapa mint → Position ACTIVA (fuente de verdad en memoria).
+ *  Las cerradas se mueven al historial en disco y salen del mapa. */
 const positions = new Map<string, Position>();
 
 /** Set de mints en proceso de venta activo — evita doble venta concurrente */
 const sellLocks = new Set<string>();
 
-/** Ruta del archivo de persistencia */
-const POSITIONS_FILE = nodePath.join(process.cwd(), 'data', 'positions.json');
+/** Firmas de ventas ejecutadas por el bot — para ignorar su eco en el WS
+ *  y no confundirlas con ventas externas (Phantom) */
+const ownSellSignatures = new Set<string>();
+const OWN_SIG_TTL_MS = 5 * 60_000;
+
+const DATA_DIR = nodePath.join(process.cwd(), 'data');
+const POSITIONS_FILE = nodePath.join(DATA_DIR, 'positions.json');
+const HISTORY_FILE = nodePath.join(DATA_DIR, 'closed-positions.jsonl');
 
 // -----------------------------------------------------------
 // Persistencia en disco
 // -----------------------------------------------------------
 
+function ensureDataDir(): void {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
 function savePositions(): void {
   try {
-    const dir = nodePath.dirname(POSITIONS_FILE);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    ensureDataDir();
     const data = JSON.stringify(Array.from(positions.values()), null, 2);
     fs.writeFileSync(POSITIONS_FILE, data, 'utf8');
   } catch (err) {
@@ -41,19 +53,31 @@ function savePositions(): void {
   }
 }
 
+/** Historial de posiciones cerradas — una línea JSON por posición (JSONL) */
+function appendToHistory(position: Position): void {
+  try {
+    ensureDataDir();
+    fs.appendFileSync(HISTORY_FILE, JSON.stringify(position) + '\n', 'utf8');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn({ err: msg }, '⚠️  No se pudo escribir en el historial');
+  }
+}
+
 function loadPositions(): void {
   try {
     if (!fs.existsSync(POSITIONS_FILE)) return;
     const raw = fs.readFileSync(POSITIONS_FILE, 'utf8');
     const arr = JSON.parse(raw) as Position[];
+    let active = 0;
     for (const pos of arr) {
+      // Solo las activas viven en memoria; las cerradas van al historial
+      if (pos.status !== 'ACTIVE') continue;
+      pos.solReceived = pos.solReceived ?? 0;
       positions.set(pos.mint, pos);
+      active++;
     }
-    const active = arr.filter((p) => p.status === 'ACTIVE').length;
-    logger.info(
-      { loaded: arr.length, active },
-      '💾 Posiciones cargadas desde disco',
-    );
+    logger.info({ active }, '💾 Posiciones activas cargadas desde disco');
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.warn({ err: msg }, '⚠️  No se pudo leer positions.json — empezando desde cero');
@@ -69,10 +93,8 @@ export function initPositionManager(): void {
   loadPositions();
   let resubscribed = 0;
   for (const pos of positions.values()) {
-    if (pos.status === 'ACTIVE') {
-      subscribeToMintTrades(pos.mint);
-      resubscribed++;
-    }
+    subscribeToMintTrades(pos.mint);
+    resubscribed++;
   }
   if (resubscribed > 0) {
     logger.info(
@@ -112,6 +134,7 @@ export function hasActivePosition(mint: string): boolean {
 // -----------------------------------------------------------
 
 export function addPosition(position: Position): void {
+  position.solReceived = position.solReceived ?? 0;
   position.highWaterMarkMcap = position.entryMarketCapSol;
   position.breakevenActive = false;
   position.trailingSLActive = false;
@@ -135,12 +158,44 @@ export function addPosition(position: Position): void {
 }
 
 // -----------------------------------------------------------
+// Cierre centralizado — TODA salida definitiva pasa por aquí
+// -----------------------------------------------------------
+
+/**
+ * Marca la posición como cerrada, calcula el PnL realizado REAL,
+ * lo registra en el risk manager (circuit breaker), archiva la
+ * posición en el historial, se desuscribe del mint y recupera
+ * la renta de la ATA. Devuelve el PnL realizado en SOL.
+ */
+function closePosition(position: Position): number {
+  position.status = 'CLOSED';
+  const realized = (position.solReceived ?? 0) - position.solSpent;
+  position.realizedPnlSol = realized;
+
+  unsubscribeMintTrades(position.mint);
+  appendToHistory(position);
+  positions.delete(position.mint);
+  savePositions();
+
+  recordClosedTrade({
+    mint: position.mint,
+    symbol: position.symbol,
+    pnlSol: realized,
+    solSpent: position.solSpent,
+  });
+
+  void reclaimAtaRent(new PublicKey(position.mint));
+  return realized;
+}
+
+// -----------------------------------------------------------
 // Procesamiento de eventos de trade
 // -----------------------------------------------------------
 
 /**
  * Actualiza el market cap actual de la posición y evalúa TP/SL.
- * También detecta ventas realizadas externamente (Phantom u otro wallet).
+ * También detecta dev-sells (señal de rug) y ventas realizadas
+ * externamente (Phantom u otro wallet).
  */
 export async function processTradeEvent(event: TradeEvent): Promise<void> {
   const position = positions.get(event.mint);
@@ -149,49 +204,38 @@ export async function processTradeEvent(event: TradeEvent): Promise<void> {
   // Actualizar market cap en tiempo real
   position.currentMarketCapSol = event.marketCapSol;
 
-  // -----------------------------------------------------------------
-  // Detección de venta externa (Phantom / manual)
-  // Si nuestra wallet vendió este token sin que el bot lo ejecutara,
-  // sincronizamos el balance y cerramos la posición si es necesario.
-  // -----------------------------------------------------------------
-  if (
-    event.txType === 'sell' &&
-    event.traderPublicKey === wallet.publicKey.toBase58()
-  ) {
+  const isOwnWallet = event.traderPublicKey === wallet.publicKey.toBase58();
+
+  if (isOwnWallet && event.txType === 'sell') {
+    // Eco de una venta ejecutada por el propio bot: la contabilidad
+    // ya la hizo executeSell — ignorar para no cerrarla como "externa".
+    if (sellLocks.has(event.mint) || ownSellSignatures.has(event.signature)) {
+      return;
+    }
+
+    // -----------------------------------------------------------------
+    // Venta externa real (Phantom / manual) — sincronizar y contabilizar
+    // -----------------------------------------------------------------
     const prevBalance = position.tokenBalance;
     const newBalance = event.newTokenBalance ?? 0;
     position.tokenBalance = newBalance;
+    position.solReceived = (position.solReceived ?? 0) + event.solAmount;
 
     logger.info(
-      {
-        mint: event.mint,
-        symbol: position.symbol,
-        prevBalance,
-        newBalance,
-      },
+      { mint: event.mint, symbol: position.symbol, prevBalance, newBalance, solReceived: event.solAmount },
       '📱 Venta externa detectada (Phantom/manual)',
     );
 
     if (newBalance < 1) {
-      position.status = 'CLOSED';
       position.tokenBalance = 0;
-      void reclaimAtaRent(new PublicKey(position.mint));
-
+      const realized = closePosition(position);
       const pnlPercent =
-        ((position.currentMarketCapSol - position.entryMarketCapSol) /
-          position.entryMarketCapSol) *
-        100;
+        position.solSpent > 0 ? (realized / position.solSpent) * 100 : 0;
 
       logger.info(
-        {
-          mint: event.mint,
-          symbol: position.symbol,
-          pnlPercent: pnlPercent.toFixed(2) + '%',
-        },
+        { mint: event.mint, symbol: position.symbol, realizedPnlSol: realized.toFixed(6) },
         '✅ Posición cerrada por venta externa',
       );
-
-      savePositions();
 
       await sendWebhook({
         event: 'POSITION_CLOSED_EXTERNAL',
@@ -200,6 +244,7 @@ export async function processTradeEvent(event: TradeEvent): Promise<void> {
         symbol: position.symbol,
         marketCapSol: position.currentMarketCapSol,
         pnlPercent: parseFloat(pnlPercent.toFixed(2)),
+        realizedPnlSol: parseFloat(realized.toFixed(6)),
         timestamp: Date.now(),
         position: {
           entryMarketCapSol: position.entryMarketCapSol,
@@ -209,10 +254,31 @@ export async function processTradeEvent(event: TradeEvent): Promise<void> {
         },
       });
     } else {
-      // Venta parcial desde Phantom — actualizar balance y guardar
       savePositions();
     }
-    return; // No evaluar TP/SL para trades externos
+    return;
+  }
+
+  // -----------------------------------------------------------------
+  // Dev vendiendo con posición abierta = señal de rug → salir YA
+  // -----------------------------------------------------------------
+  if (
+    event.txType === 'sell' &&
+    position.creator !== undefined &&
+    event.traderPublicKey === position.creator &&
+    !sellLocks.has(event.mint)
+  ) {
+    logger.warn(
+      { mint: event.mint, symbol: position.symbol, devSoldSol: event.solAmount },
+      '🚨 DEV VENDIENDO — salida inmediata de la posición',
+    );
+    await executeSell(
+      position,
+      position.tokenBalance,
+      'DEV_SELL_EXIT',
+      `Dev vendió ${event.solAmount.toFixed(3)} SOL — salida defensiva`,
+    );
+    return;
   }
 
   // Actualizar High Water Mark y recalcular trailing SL
@@ -306,11 +372,12 @@ function updateTrailingSLPhases(position: Position): void {
 }
 
 // -----------------------------------------------------------
-// Lógica TP/SL — evaluación en cada tick de precio
+// Lógica TP/SL — evaluación en cada tick de precio y en el monitor
 // -----------------------------------------------------------
 
 async function evaluateTpSl(position: Position): Promise<void> {
   if (sellLocks.has(position.mint)) return;
+  if (position.tokenBalance < 1) return; // nada que vender aún (balance en recuperación)
 
   const entry = position.entryMarketCapSol;
   const current = position.currentMarketCapSol;
@@ -380,6 +447,26 @@ async function executeSell(
     return;
   }
 
+  // Sin tokens que vender (p. ej. balance nunca recuperado) → cierre contable
+  if (tokenAmount < 1) {
+    logger.warn(
+      { mint: position.mint, event, tokenAmount },
+      '⚠️  Cierre sin venta: balance < 1 token',
+    );
+    const realized = closePosition(position);
+    await sendWebhook({
+      event,
+      mint: position.mint,
+      name: position.name,
+      symbol: position.symbol,
+      marketCapSol: position.currentMarketCapSol,
+      realizedPnlSol: parseFloat(realized.toFixed(6)),
+      error: 'Cerrada sin venta: balance de tokens < 1',
+      timestamp: Date.now(),
+    });
+    return;
+  }
+
   sellLocks.add(position.mint);
   logger.info(
     {
@@ -395,23 +482,25 @@ async function executeSell(
   try {
     const result = await sellToken(position.mint, tokenAmount);
 
-    const pnlPercent =
-      ((position.currentMarketCapSol - position.entryMarketCapSol) /
-        position.entryMarketCapSol) *
-      100;
+    // Registrar la firma propia para ignorar su eco en el WS
+    ownSellSignatures.add(result.signature);
+    setTimeout(() => ownSellSignatures.delete(result.signature), OWN_SIG_TTL_MS).unref();
+
+    // Contabilidad REAL: SOL neto recibido en esta venta
+    position.solReceived = (position.solReceived ?? 0) + result.solReceived;
 
     const record: TradeRecord = {
       timestamp: Date.now(),
       action: 'SELL',
-      tokenAmount,
-      solAmount: 0,
+      tokenAmount: result.tokensSold,
+      solAmount: result.solReceived,
       marketCapSol: position.currentMarketCapSol,
       signature: result.signature,
       reason,
     };
     position.trades.push(record);
 
-    position.tokenBalance = Math.max(0, position.tokenBalance - tokenAmount);
+    position.tokenBalance = Math.max(0, position.tokenBalance - result.tokensSold);
 
     if (event === 'TP1_TRIGGERED') {
       position.tp1Hit = true;
@@ -427,23 +516,34 @@ async function executeSell(
     } else if (event === 'TP2_TRIGGERED') {
       position.tp2Hit = true;
     } else {
-      position.status = 'CLOSED';
+      // SL / panic / time-exit / dev-sell → salida total
       position.tokenBalance = 0;
-      void reclaimAtaRent(new PublicKey(position.mint));
     }
 
-    if (position.tokenBalance < 1) {
-      position.status = 'CLOSED';
-      void reclaimAtaRent(new PublicKey(position.mint));
+    const isFullExit = position.tokenBalance < 1;
+    let realized: number | undefined;
+    if (isFullExit) {
+      realized = closePosition(position);
+    } else {
+      savePositions();
     }
 
-    savePositions();
+    const totalReceived = position.solReceived ?? 0;
+    const realizedSoFar = totalReceived - position.solSpent;
+    const pnlPercent =
+      position.solSpent > 0 && isFullExit
+        ? (realizedSoFar / position.solSpent) * 100
+        : ((position.currentMarketCapSol - position.entryMarketCapSol) /
+            position.entryMarketCapSol) *
+          100;
 
     logger.info(
       {
         mint: position.mint,
         signature: result.signature,
         newBalance: position.tokenBalance,
+        solReceivedNow: result.solReceived.toFixed(6),
+        realizedPnlSol: realizedSoFar.toFixed(6),
         pnlPercent: pnlPercent.toFixed(2) + '%',
         status: position.status,
       },
@@ -456,9 +556,11 @@ async function executeSell(
       name: position.name,
       symbol: position.symbol,
       marketCapSol: position.currentMarketCapSol,
-      tokenAmount,
+      tokenAmount: result.tokensSold,
+      solAmount: result.solReceived,
       signature: result.signature,
       pnlPercent: parseFloat(pnlPercent.toFixed(2)),
+      realizedPnlSol: parseFloat((realized ?? realizedSoFar).toFixed(6)),
       timestamp: Date.now(),
       position: {
         entryMarketCapSol: position.entryMarketCapSol,
@@ -504,45 +606,94 @@ export async function executePanicSell(mint: string): Promise<void> {
 }
 
 // -----------------------------------------------------------
-// Monitor de tiempo — cierre automático de posiciones zombie
+// Monitor de posiciones — corre cada 10 s
+//   1. Evalúa TP/SL aunque NO lleguen trades (tokens muertos)
+//   2. Recupera balances que quedaron en 0 tras la compra
+//   3. Cierra posiciones zombie por tiempo máximo
 // -----------------------------------------------------------
 
-export function startPositionMonitor(): void {
-  const intervalMs = 60_000;
+const MONITOR_INTERVAL_MS = 10_000;
+
+/** Reintenta leer el balance real de posiciones registradas con balance 0 */
+async function recoverMissingBalance(position: Position): Promise<void> {
+  try {
+    const bal = await getTokenDisplayBalance(new PublicKey(position.mint));
+    if (bal < 1) return;
+
+    position.tokenBalance = bal;
+    position.initialTokenBalance = bal;
+    // Con el balance real ya se puede calcular la entrada REAL del fill
+    const entry = (position.solSpent / bal) * config.PUMP_TOTAL_SUPPLY;
+    position.entryMarketCapSol = entry;
+    position.highWaterMarkMcap = Math.max(position.highWaterMarkMcap ?? 0, entry);
+    if (!position.breakevenActive && !position.trailingSLActive) {
+      position.effectiveSLThreshold = entry * (1 - config.SL_PERCENT / 100);
+    }
+    savePositions();
+    logger.info(
+      { mint: position.mint, balance: bal, entryMcap: entry.toFixed(4) },
+      '🔧 Balance recuperado — posición ahora vendible',
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.debug({ mint: position.mint, err: msg }, 'Recuperación de balance fallida — se reintentará');
+  }
+}
+
+async function monitorTick(): Promise<void> {
+  const now = Date.now();
   const maxMs = config.MAX_HOLD_MINUTES * 60_000;
 
-  setInterval(() => {
-    const now = Date.now();
-    for (const position of positions.values()) {
-      if (position.status !== 'ACTIVE') continue;
-      if (sellLocks.has(position.mint)) continue;
+  for (const position of Array.from(positions.values())) {
+    if (position.status !== 'ACTIVE') continue;
+    if (sellLocks.has(position.mint)) continue;
 
-      const holdMs = now - position.entryTimestamp;
-      if (holdMs < maxMs) continue;
-
-      const holdMin = (holdMs / 60_000).toFixed(1);
-      logger.warn(
-        {
-          mint: position.mint,
-          symbol: position.symbol,
-          holdMinutes: holdMin,
-          limit: config.MAX_HOLD_MINUTES,
-          tokenBalance: position.tokenBalance,
-        },
-        `⏰ Posición zombie detectada — cerrando por tiempo (${holdMin} min)`,
-      );
-
-      void executeSell(
-        position,
-        position.tokenBalance,
-        'POSITION_CLOSED_TIME_EXPIRED',
-        `Time-based exit: posición abierta ${holdMin} min (límite: ${config.MAX_HOLD_MINUTES} min)`,
-      );
+    // 1. Recuperar balance 0 (compra confirmada pero RPC no propagó a tiempo)
+    if (position.tokenBalance < 1 && position.initialTokenBalance < 1) {
+      await recoverMissingBalance(position);
     }
-  }, intervalMs);
+
+    // 2. Evaluar SL/TP sin depender de que alguien tradee el token
+    if (position.tokenBalance >= 1) {
+      updateTrailingSLPhases(position);
+      await evaluateTpSl(position);
+      if (position.status !== 'ACTIVE' || sellLocks.has(position.mint)) continue;
+    }
+
+    // 3. Cierre por tiempo máximo (posición zombie)
+    const holdMs = now - position.entryTimestamp;
+    if (holdMs < maxMs) continue;
+
+    const holdMin = (holdMs / 60_000).toFixed(1);
+    logger.warn(
+      {
+        mint: position.mint,
+        symbol: position.symbol,
+        holdMinutes: holdMin,
+        limit: config.MAX_HOLD_MINUTES,
+        tokenBalance: position.tokenBalance,
+      },
+      `⏰ Posición zombie detectada — cerrando por tiempo (${holdMin} min)`,
+    );
+
+    await executeSell(
+      position,
+      position.tokenBalance,
+      'POSITION_CLOSED_TIME_EXPIRED',
+      `Time-based exit: posición abierta ${holdMin} min (límite: ${config.MAX_HOLD_MINUTES} min)`,
+    );
+  }
+}
+
+export function startPositionMonitor(): void {
+  setInterval(() => {
+    void monitorTick().catch((err) => {
+      logger.error({ err }, 'Error en monitorTick');
+    });
+  }, MONITOR_INTERVAL_MS);
 
   logger.info(
-    { checkIntervalMin: 1, maxHoldMin: config.MAX_HOLD_MINUTES },
-    '⏱️  Monitor de tiempo de posiciones iniciado',
+    { checkIntervalSec: MONITOR_INTERVAL_MS / 1000, maxHoldMin: config.MAX_HOLD_MINUTES },
+    '⏱️  Monitor de posiciones iniciado (TP/SL + balance + tiempo)',
   );
 }

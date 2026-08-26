@@ -1,5 +1,12 @@
 import { PublicKey } from '@solana/web3.js';
-import { wallet, getTokenDisplayBalance, signAndSendTransaction } from './solana';
+import {
+  wallet,
+  getTokenDisplayBalance,
+  signAndSendTransaction,
+  getTokenDeltaFromTx,
+  getWalletSolDeltaFromTx,
+  getPriorityFeeSol,
+} from './solana';
 import { config } from '../config';
 import { logger } from '../logger';
 
@@ -33,8 +40,10 @@ async function executePumpTrade(params: PumpTradeParams): Promise<string> {
     denominatedInSol: params.denominatedInSol ? 'true' : 'false',
     amount: params.amount,
     slippage: config.SLIPPAGE_PERCENT,
-    priorityFee: config.PRIORITY_FEE_SOL,
-    pool: 'pump',
+    priorityFee: await getPriorityFeeSol(),
+    // 'auto' resuelve el pool correcto — crítico para vender tokens
+    // que ya migraron de la bonding curve a PumpSwap/Raydium
+    pool: 'auto',
   };
 
   logger.debug({ body }, 'Llamando PumpPortal API');
@@ -139,8 +148,12 @@ export async function buyToken(
     denominatedInSol: true,
   });
 
-  // Reintentar hasta obtener balance real — la RPC tarda en propagar el ATA
-  const tokenBalance = await waitForTokenBalance(new PublicKey(mint));
+  // Fuente primaria: tokens exactos del fill leídos de la tx confirmada.
+  // Fallback: polling del ATA (la RPC tarda en propagarlo).
+  let tokenBalance = (await getTokenDeltaFromTx(signature, mint)) ?? 0;
+  if (tokenBalance < 1) {
+    tokenBalance = await waitForTokenBalance(new PublicKey(mint));
+  }
 
   logger.info(
     { mint, signature, tokenBalance, solAmount },
@@ -158,6 +171,8 @@ export interface SellResult {
   signature: string;
   mint: string;
   tokensSold: number;
+  /** SOL neto recibido en la venta (leído de la tx confirmada; 0 si no se pudo leer) */
+  solReceived: number;
 }
 
 /**
@@ -182,10 +197,19 @@ export async function sellToken(
     denominatedInSol: false,
   });
 
+  // SOL REAL recibido (neto de fees) — imprescindible para medir PnL de verdad
+  const solReceived = (await getWalletSolDeltaFromTx(signature)) ?? 0;
+  if (solReceived <= 0) {
+    logger.warn(
+      { mint, signature },
+      '⚠️  No se pudo leer el SOL recibido de la tx — PnL de esta venta quedará en 0',
+    );
+  }
+
   logger.info(
-    { mint, signature, tokenAmount: roundedAmount },
+    { mint, signature, tokenAmount: roundedAmount, solReceived: solReceived.toFixed(6) },
     '✅ VENTA confirmada',
   );
 
-  return { signature, mint, tokensSold: roundedAmount };
+  return { signature, mint, tokensSold: roundedAmount, solReceived: Math.max(0, solReceived) };
 }

@@ -1,5 +1,7 @@
+import { PublicKey } from '@solana/web3.js';
 import { config } from '../config';
 import { logger } from '../logger';
+import { connection } from './solana';
 import { FilterResult, NewTokenEvent, TokenMetadata } from '../types';
 
 // -----------------------------------------------------------
@@ -10,6 +12,79 @@ import { FilterResult, NewTokenEvent, TokenMetadata } from '../types';
 const SCORE_DEV_BUY = 40;
 const SCORE_SOL_AMOUNT = 30;
 const SCORE_SOCIAL_LINKS = 30;
+
+// -----------------------------------------------------------
+// Registro local de creadores — gratis (sin RPC)
+// -----------------------------------------------------------
+// El bot ve TODOS los `create` por el WS, así que puede detectar
+// devs que lanzan tokens en serie (patrón clásico de rug factory).
+
+const creatorCreations = new Map<string, number[]>();
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Registrar cada evento `create` visto, pase o no los filtros */
+export function registerTokenCreation(creator: string): void {
+  const cutoff = Date.now() - DAY_MS;
+  const recent = (creatorCreations.get(creator) ?? []).filter((t) => t >= cutoff);
+  recent.push(Date.now());
+  creatorCreations.set(creator, recent);
+}
+
+/** Purga entradas viejas del registro (llamar periódicamente) */
+export function pruneCreatorRegistry(): void {
+  const cutoff = Date.now() - DAY_MS;
+  for (const [creator, times] of creatorCreations) {
+    const recent = times.filter((t) => t >= cutoff);
+    if (recent.length === 0) creatorCreations.delete(creator);
+    else creatorCreations.set(creator, recent);
+  }
+}
+
+/**
+ * Check local: ¿este dev ya creó demasiados tokens en 24h?
+ * (el token actual ya está registrado, por eso se compara con >)
+ */
+export function checkCreatorLocal(creator: string): FilterResult {
+  const cutoff = Date.now() - DAY_MS;
+  const count = (creatorCreations.get(creator) ?? []).filter((t) => t >= cutoff).length;
+  if (count > config.CREATOR_MAX_TOKENS_PER_DAY) {
+    return {
+      passed: false,
+      reason: `Dev creó ${count} tokens en 24h (máx. ${config.CREATOR_MAX_TOKENS_PER_DAY}) — patrón de rug en serie`,
+      score: 0,
+    };
+  }
+  return { passed: true, score: 0 };
+}
+
+/**
+ * Check RPC: historial on-chain de la wallet del creador.
+ * Una wallet con cientos de txs creando tokens es un operador
+ * en serie, no un proyecto. Fail-open: si la RPC falla, no bloquea.
+ */
+export async function checkCreatorHistory(creator: string): Promise<FilterResult> {
+  if (!config.CHECK_CREATOR_HISTORY) return { passed: true, score: 0 };
+  try {
+    const sigs = await connection.getSignaturesForAddress(
+      new PublicKey(creator),
+      { limit: config.CREATOR_HISTORY_MAX_TXS },
+      'confirmed',
+    );
+    if (sigs.length >= config.CREATOR_HISTORY_MAX_TXS) {
+      return {
+        passed: false,
+        reason: `Wallet del dev hiperactiva: >=${config.CREATOR_HISTORY_MAX_TXS} txs en el historial`,
+        score: 0,
+      };
+    }
+    logger.debug({ creator, txCount: sigs.length }, 'Check creatorHistory ✓');
+    return { passed: true, score: 0 };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn({ creator, err: msg }, 'checkCreatorHistory: fallo RPC — dejando pasar (fail-open)');
+    return { passed: true, score: 0 };
+  }
+}
 
 // -----------------------------------------------------------
 // Check 1: El dev no compró más del % máximo del supply

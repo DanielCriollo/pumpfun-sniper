@@ -4,6 +4,7 @@ import { config } from './config';
 import { logger } from './logger';
 import { state, setPaused } from './state';
 import { executePanicSell, getPosition, getAllPositions } from './services/positionManager';
+import { getDailyStats } from './services/riskManager';
 import { ApiResponse } from './types';
 
 // -----------------------------------------------------------
@@ -108,12 +109,23 @@ server.post('/api/toggle-pause', async (request, reply) => {
 // -----------------------------------------------------------
 server.get('/api/status', async (_request, reply) => {
   const activePositions = getAllPositions().filter((p) => p.status === 'ACTIVE');
+  const daily = getDailyStats();
 
   const body: ApiResponse = {
     success: true,
     data: {
       isPaused: state.isPaused,
       wsConnected: state.wsInstance !== null,
+      daily: {
+        date: daily.date,
+        realizedPnlSol: parseFloat(daily.realizedPnlSol.toFixed(6)),
+        trades: daily.trades,
+        wins: daily.wins,
+        losses: daily.losses,
+        consecutiveLosses: daily.consecutiveLosses,
+        circuitBreakerTripped: daily.breakerTripped,
+        circuitBreakerReason: daily.breakerReason ?? null,
+      },
       activePositions: activePositions.length,
       positions: activePositions.map((p) => ({
         mint: p.mint,

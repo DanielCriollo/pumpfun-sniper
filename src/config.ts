@@ -92,6 +92,27 @@ export const config: Config = {
 
   // Position sizing dinámico
   DYNAMIC_BUY_PERCENT: envNumber('DYNAMIC_BUY_PERCENT', 0),
+
+  // Estrategia de entrada — ventana de observación (0 = snipe inmediato)
+  ENTRY_OBSERVATION_SECONDS: envNumber('ENTRY_OBSERVATION_SECONDS', 8),
+  MIN_UNIQUE_BUYERS: envNumber('MIN_UNIQUE_BUYERS', 4),
+
+  // Filtros de creador
+  CREATOR_MAX_TOKENS_PER_DAY: envNumber('CREATOR_MAX_TOKENS_PER_DAY', 1),
+  CHECK_CREATOR_HISTORY: envBool('CHECK_CREATOR_HISTORY', true),
+  CREATOR_HISTORY_MAX_TXS: envNumber('CREATOR_HISTORY_MAX_TXS', 100),
+
+  // Circuit breaker
+  MAX_DAILY_LOSS_SOL: envNumber('MAX_DAILY_LOSS_SOL', 0.3),
+  MAX_CONSECUTIVE_LOSSES: envNumber('MAX_CONSECUTIVE_LOSSES', 5),
+
+  // WebSocket watchdog
+  WS_MAX_SILENCE_MS: envNumber('WS_MAX_SILENCE_MS', 45_000),
+
+  // Fees
+  DYNAMIC_PRIORITY_FEE: envBool('DYNAMIC_PRIORITY_FEE', false),
+  MAX_PRIORITY_FEE_SOL: envNumber('MAX_PRIORITY_FEE_SOL', 0.005),
+  SKIP_PREFLIGHT: envBool('SKIP_PREFLIGHT', false),
 };
 
 // -----------------------------------------------------------
@@ -105,4 +126,10 @@ if (config.TP1_PERCENT >= config.TP2_PERCENT) {
 }
 if (config.TRAILING_SL_BREAKEVEN_PERCENT >= config.TRAILING_SL_ACTIVATE_PERCENT) {
   throw new Error('[Config] TRAILING_SL_BREAKEVEN_PERCENT debe ser menor que TRAILING_SL_ACTIVATE_PERCENT');
+}
+if (config.DYNAMIC_PRIORITY_FEE && config.MAX_PRIORITY_FEE_SOL < config.PRIORITY_FEE_SOL) {
+  throw new Error('[Config] MAX_PRIORITY_FEE_SOL debe ser >= PRIORITY_FEE_SOL');
+}
+if (config.ENTRY_OBSERVATION_SECONDS < 0 || config.ENTRY_OBSERVATION_SECONDS > 60) {
+  throw new Error('[Config] ENTRY_OBSERVATION_SECONDS debe estar entre 0 y 60');
 }

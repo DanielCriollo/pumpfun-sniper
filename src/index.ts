@@ -6,10 +6,18 @@ import {
   setWsInstance,
   incrementReconnects,
   resetReconnects,
+  markWsMessage,
   subscribeToMintTrades,
+  unsubscribeMintTrades,
 } from './state';
-import { applyFilters } from './services/filters';
-import { buyToken } from './services/pumpfun';
+import {
+  applyFilters,
+  registerTokenCreation,
+  checkCreatorLocal,
+  checkCreatorHistory,
+  pruneCreatorRegistry,
+} from './services/filters';
+import { buyToken, BuyResult } from './services/pumpfun';
 import {
   addPosition,
   initPositionManager,
@@ -18,6 +26,12 @@ import {
   getActivePositionCount,
   hasActivePosition,
 } from './services/positionManager';
+import {
+  observeToken,
+  handleObservationTrade,
+  ObservationResult,
+} from './services/observer';
+import { initRiskManager } from './services/riskManager';
 import { sendWebhook } from './services/webhook';
 import { startServer } from './server';
 import { getSolBalance } from './services/solana';
@@ -33,8 +47,11 @@ import { NewTokenEvent, TradeEvent, Position } from './types';
 
 /** Mints cuya compra está actualmente en proceso — previene doble entrada por mint */
 const inFlightMints = new Set<string>();
-/** Compras actualmente en vuelo (incluye las que están en filtros/fetch) */
+/** Compras actualmente en vuelo (incluye las que están en filtros/observación) */
 let inFlightBuyCount = 0;
+/** SOL comprometido en compras en vuelo — evita que compras concurrentes
+ *  lean el mismo balance y violen MIN_SOL_RESERVE */
+let reservedSol = 0;
 /** Mapa símbolo → timestamp de última compra — evita entrar dos veces en el mismo proyecto */
 const recentSymbolBuys = new Map<string, number>();
 const SYMBOL_COOLDOWN_MS = 30_000; // 30 segundos
@@ -56,7 +73,7 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
   // 3. Límite de posiciones: activas + en vuelo (chequeo atómico pre-await)
   const totalActive = getActivePositionCount() + inFlightBuyCount;
   if (totalActive >= config.MAX_CONCURRENT_POSITIONS) {
-    logger.warn(
+    logger.debug(
       { mint: event.mint, active: getActivePositionCount(), inFlight: inFlightBuyCount },
       'Límite de posiciones alcanzado — token ignorado',
     );
@@ -83,6 +100,25 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
     return;
   }
 
+  // 6. Filtro local de creador en serie (sin costo de red)
+  const creatorLocal = checkCreatorLocal(event.traderPublicKey);
+  if (!creatorLocal.passed) {
+    logger.info(
+      { mint: event.mint, reason: creatorLocal.reason },
+      '🚫 Filtro RECHAZADO [creatorLocal]',
+    );
+    await sendWebhook({
+      event: 'FILTER_REJECTED',
+      mint: event.mint,
+      name: event.name,
+      symbol: event.symbol,
+      marketCapSol: event.marketCapSol,
+      filterReason: creatorLocal.reason,
+      timestamp: Date.now(),
+    });
+    return;
+  }
+
   logger.info(
     {
       mint: event.mint,
@@ -98,69 +134,131 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
   inFlightBuyCount++;
 
   try {
-    // Aplicar filtros anti-rug (incluye fetch de metadatos — operación async)
-    const filterResult = await applyFilters(event);
-    if (!filterResult.passed) {
+    // La ventana de observación necesita el stream de trades del mint
+    const observing = config.ENTRY_OBSERVATION_SECONDS > 0;
+    if (observing) subscribeToMintTrades(event.mint);
+
+    // En paralelo: filtros de metadatos, historial del creador y observación.
+    // La observación (varios segundos) absorbe la latencia de los otros dos.
+    const [filterResult, creatorHistory, obsResult] = await Promise.all([
+      applyFilters(event),
+      checkCreatorHistory(event.traderPublicKey),
+      observing
+        ? observeToken(event)
+        : Promise.resolve(null as ObservationResult | null),
+    ]);
+
+    const rejectionReason = !filterResult.passed
+      ? filterResult.reason
+      : !creatorHistory.passed
+        ? creatorHistory.reason
+        : obsResult && !obsResult.passed
+          ? obsResult.reason
+          : null;
+
+    if (rejectionReason) {
+      logger.info(
+        { mint: event.mint, symbol: event.symbol, reason: rejectionReason },
+        '🚫 Entrada RECHAZADA',
+      );
       await sendWebhook({
         event: 'FILTER_REJECTED',
         mint: event.mint,
         name: event.name,
         symbol: event.symbol,
-        marketCapSol: event.marketCapSol,
-        filterReason: filterResult.reason,
+        marketCapSol: obsResult?.finalMcap ?? event.marketCapSol,
+        filterReason: rejectionReason,
         timestamp: Date.now(),
       });
       return;
     }
 
-    // Verificar balance antes de comprar
+    // Pudo pausarse (o dispararse el circuit breaker) durante la ventana
+    if (state.isPaused) {
+      logger.info({ mint: event.mint }, 'Bot pausado durante la observación — compra cancelada');
+      return;
+    }
+
+    if (obsResult) {
+      logger.info(
+        {
+          mint: event.mint,
+          uniqueBuyers: obsResult.uniqueBuyers,
+          buys: obsResult.buyCount,
+          sells: obsResult.sellCount,
+          mcap: obsResult.finalMcap.toFixed(2),
+        },
+        '✅ Observación superada — token con tracción',
+      );
+    }
+
+    // Verificar balance descontando el SOL ya comprometido en otras compras
     const solBalance = await getSolBalance();
+    const availableSol = solBalance - reservedSol;
 
     // Dynamic position sizing: usa % del SOL libre si DYNAMIC_BUY_PERCENT > 0
     const buyAmount =
       config.DYNAMIC_BUY_PERCENT > 0
-        ? Math.max(solBalance * (config.DYNAMIC_BUY_PERCENT / 100), 0.001)
+        ? Math.max(availableSol * (config.DYNAMIC_BUY_PERCENT / 100), 0.001)
         : config.BUY_AMOUNT_SOL;
 
     // Reserva mínima de SOL — siempre conservar MIN_SOL_RESERVE para fees
-    if (solBalance < buyAmount + config.MIN_SOL_RESERVE) {
+    if (availableSol < buyAmount + config.MIN_SOL_RESERVE) {
       logger.warn(
-        { solBalance, required: buyAmount, reserve: config.MIN_SOL_RESERVE },
+        { solBalance, reservedSol, required: buyAmount, reserve: config.MIN_SOL_RESERVE },
         '⚠️  Balance insuficiente — reserva mínima protegida',
       );
       return;
     }
 
-    const buyResult = await buyToken(event.mint, buyAmount);
+    // Comprometer el monto ANTES del await de compra (sin gaps async)
+    reservedSol += buyAmount;
+    let buyResult: BuyResult;
+    try {
+      buyResult = await buyToken(event.mint, buyAmount);
+    } finally {
+      reservedSol -= buyAmount;
+    }
 
     // Registrar símbolo como comprado (antes de addPosition para proteger contra errores)
     recentSymbolBuys.set(symbolKey, Date.now());
 
-    // Crear y registrar la posición
+    // -----------------------------------------------------------------
+    // ENTRADA REAL: calculada del fill (SOL pagado / tokens recibidos),
+    // no del mcap del evento `create` (que queda viejo tras la latencia
+    // de filtros + observación + confirmación). Todo TP/SL se ancla aquí.
+    // -----------------------------------------------------------------
+    const entryMcap =
+      buyResult.tokenBalance >= 1
+        ? (buyAmount / buyResult.tokenBalance) * config.PUMP_TOTAL_SUPPLY
+        : (obsResult?.finalMcap ?? event.marketCapSol);
+
     const tradeRecord = {
       timestamp: Date.now(),
       action: 'BUY' as const,
       tokenAmount: buyResult.tokenBalance,
       solAmount: buyAmount,
-      marketCapSol: event.marketCapSol,
+      marketCapSol: entryMcap,
       signature: buyResult.signature,
-      reason: 'Filtros superados — compra inicial',
+      reason: 'Filtros y observación superados — compra inicial',
     };
 
     const position: Position = {
       mint: event.mint,
       name: event.name,
       symbol: event.symbol,
-      entryMarketCapSol: event.marketCapSol,
-      currentMarketCapSol: event.marketCapSol,
+      entryMarketCapSol: entryMcap,
+      currentMarketCapSol: entryMcap,
       tokenBalance: buyResult.tokenBalance,
       initialTokenBalance: buyResult.tokenBalance,
       solSpent: buyAmount,
+      solReceived: 0,
       entryTimestamp: Date.now(),
       tp1Hit: false,
       tp2Hit: false,
       status: 'ACTIVE',
       bondingCurveKey: event.bondingCurveKey,
+      creator: event.traderPublicKey,
       trades: [tradeRecord],
     };
 
@@ -175,13 +273,13 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
       mint: event.mint,
       name: event.name,
       symbol: event.symbol,
-      marketCapSol: event.marketCapSol,
+      marketCapSol: entryMcap,
       solAmount: buyAmount,
       tokenAmount: buyResult.tokenBalance,
       signature: buyResult.signature,
       timestamp: Date.now(),
       position: {
-        entryMarketCapSol: event.marketCapSol,
+        entryMarketCapSol: entryMcap,
         tokenBalance: buyResult.tokenBalance,
       },
     });
@@ -200,6 +298,10 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
     // Siempre liberar el slot, haya compra exitosa o error
     inFlightMints.delete(event.mint);
     inFlightBuyCount--;
+    // Si no quedó posición (rechazo o error), limpiar la suscripción temporal
+    if (!hasActivePosition(event.mint)) {
+      unsubscribeMintTrades(event.mint);
+    }
   }
 }
 
@@ -212,6 +314,8 @@ async function handleTradeEvent(event: TradeEvent): Promise<void> {
 // -----------------------------------------------------------
 
 function onWsMessage(data: WebSocket.RawData): void {
+  markWsMessage();
+
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(data.toString()) as Record<string, unknown>;
@@ -223,18 +327,24 @@ function onWsMessage(data: WebSocket.RawData): void {
   const txType = parsed['txType'];
 
   if (txType === 'create') {
+    const event = parsed as unknown as NewTokenEvent;
+    // Inteligencia de creadores: registrar TODOS los create, se compre o no
+    registerTokenCreation(event.traderPublicKey);
     // Usar void + IIFE para manejar la promesa sin bloquear el event loop
     void (async () => {
       try {
-        await handleNewToken(parsed as unknown as NewTokenEvent);
+        await handleNewToken(event);
       } catch (err) {
         logger.error({ err }, 'Error no capturado en handleNewToken');
       }
     })();
   } else if (txType === 'buy' || txType === 'sell') {
+    const event = parsed as unknown as TradeEvent;
+    // Los mints bajo observación consumen el evento aquí
+    if (handleObservationTrade(event)) return;
     void (async () => {
       try {
-        await handleTradeEvent(parsed as unknown as TradeEvent);
+        await handleTradeEvent(event);
       } catch (err) {
         logger.error({ err }, 'Error no capturado en handleTradeEvent');
       }
@@ -277,14 +387,20 @@ function connectWebSocket(): void {
 
     ws.on('open', () => {
       resetReconnects();
+      markWsMessage();
       logger.info('🟢 WebSocket conectado a PumpPortal');
 
       // Suscribirse a nuevos tokens
       ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
 
-      // Re-suscribirse a los mints de posiciones activas
-      for (const mint of state.subscribedMints) {
-        ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
+      // Re-suscribirse a los mints de posiciones activas (en un solo mensaje)
+      if (state.subscribedMints.size > 0) {
+        ws.send(
+          JSON.stringify({
+            method: 'subscribeTokenTrade',
+            keys: Array.from(state.subscribedMints),
+          }),
+        );
       }
 
       logger.info(
@@ -294,6 +410,7 @@ function connectWebSocket(): void {
     });
 
     ws.on('message', onWsMessage);
+    ws.on('pong', markWsMessage);
 
     ws.on('error', (err: Error) => {
       logger.error({ err: err.message }, '⚠️  Error en WebSocket');
@@ -309,6 +426,51 @@ function connectWebSocket(): void {
       connectWebSocket();
     });
   }, delay);
+}
+
+// -----------------------------------------------------------
+// Watchdog del WebSocket — detecta conexiones "zombies"
+// -----------------------------------------------------------
+// PumpPortal puede dejar de emitir sin cerrar el socket. Con
+// posiciones abiertas eso significa quedarse ciego sin SL.
+// Si no llega NINGÚN mensaje en WS_MAX_SILENCE_MS → reconectar.
+
+function startWsWatchdog(): void {
+  setInterval(() => {
+    const ws = state.wsInstance;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    const silenceMs = Date.now() - state.lastWsMessageAt;
+
+    if (silenceMs >= config.WS_MAX_SILENCE_MS) {
+      logger.warn(
+        { silenceMs, limit: config.WS_MAX_SILENCE_MS },
+        '🐶 Watchdog: WebSocket silencioso — forzando reconexión',
+      );
+      ws.terminate(); // dispara 'close' → reconexión automática
+    } else if (silenceMs >= config.WS_MAX_SILENCE_MS / 2) {
+      ws.ping();
+    }
+  }, 5_000);
+
+  logger.info(
+    { maxSilenceMs: config.WS_MAX_SILENCE_MS },
+    '🐶 Watchdog de WebSocket iniciado',
+  );
+}
+
+// -----------------------------------------------------------
+// Mantenimiento periódico — purga de mapas en memoria
+// -----------------------------------------------------------
+
+function startMaintenance(): void {
+  setInterval(() => {
+    const now = Date.now();
+    for (const [symbol, ts] of recentSymbolBuys) {
+      if (now - ts > SYMBOL_COOLDOWN_MS) recentSymbolBuys.delete(symbol);
+    }
+    pruneCreatorRegistry();
+  }, 60_000);
 }
 
 // -----------------------------------------------------------
@@ -339,8 +501,11 @@ function setupGracefulShutdown(): void {
     logger.error({ reason }, '🚨 unhandledRejection');
   });
   process.on('uncaughtException', (err) => {
-    logger.error({ err }, '🚨 uncaughtException');
-    // No cerramos: PM2 reiniciará si es fatal
+    // Con dinero en juego, un estado corrupto es peor que un reinicio:
+    // salir y dejar que PM2 levante el proceso limpio (las posiciones
+    // se recuperan de positions.json).
+    logger.fatal({ err }, '🚨 uncaughtException — reiniciando proceso');
+    process.exit(1);
   });
 }
 
@@ -354,14 +519,21 @@ async function main(): Promise<void> {
   // Montar manejadores de señales
   setupGracefulShutdown();
 
+  // Cargar métricas diarias y circuit breaker
+  initRiskManager();
+
   // Iniciar API interna (Fastify)
   await startServer();
 
   // Cargar posiciones persistidas y re-suscribir mints activos
   initPositionManager();
 
-  // Iniciar monitor de posiciones zombie (time-based exit)
+  // Iniciar monitor de posiciones (TP/SL + balance + tiempo)
   startPositionMonitor();
+
+  // Watchdog y mantenimiento
+  startWsWatchdog();
+  startMaintenance();
 
   // Conectar WebSocket a PumpPortal
   connectWebSocket();
@@ -369,10 +541,15 @@ async function main(): Promise<void> {
   logger.info(
     {
       buyMode: config.DYNAMIC_BUY_PERCENT > 0 ? `${config.DYNAMIC_BUY_PERCENT}% del balance` : `${config.BUY_AMOUNT_SOL} SOL fijo`,
+      entryMode:
+        config.ENTRY_OBSERVATION_SECONDS > 0
+          ? `observación ${config.ENTRY_OBSERVATION_SECONDS}s (mín. ${config.MIN_UNIQUE_BUYERS} compradores)`
+          : 'snipe inmediato',
       maxPositions: config.MAX_CONCURRENT_POSITIONS,
       tp1: `+${config.TP1_PERCENT}% → sell ${config.TP1_SELL_PERCENT}%`,
       tp2: `+${config.TP2_PERCENT}% → sell ${config.TP2_SELL_PERCENT}%`,
       sl: `-${config.SL_PERCENT}%`,
+      circuitBreaker: `-${config.MAX_DAILY_LOSS_SOL} SOL/día o ${config.MAX_CONSECUTIVE_LOSSES} pérdidas seguidas`,
       maxMcapEntry: config.MAX_ENTRY_MCAP_SOL > 0 ? `${config.MAX_ENTRY_MCAP_SOL} SOL` : 'sin límite',
       minSolReserve: `${config.MIN_SOL_RESERVE} SOL`,
     },

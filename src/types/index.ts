@@ -63,6 +63,27 @@ export interface Config {
 
   // Position sizing dinámico (0 = desactivado → usa BUY_AMOUNT_SOL fijo)
   DYNAMIC_BUY_PERCENT: number;
+
+  // Estrategia de entrada — ventana de observación
+  ENTRY_OBSERVATION_SECONDS: number;  // 0 = snipe inmediato al create
+  MIN_UNIQUE_BUYERS: number;          // compradores únicos mínimos en la ventana
+
+  // Filtros de creador
+  CREATOR_MAX_TOKENS_PER_DAY: number; // máx. tokens creados por el mismo dev en 24h
+  CHECK_CREATOR_HISTORY: boolean;     // consulta RPC del historial del dev
+  CREATOR_HISTORY_MAX_TXS: number;    // rechazar si el dev tiene >= N txs (wallet hiperactiva)
+
+  // Circuit breaker (gestión de riesgo global)
+  MAX_DAILY_LOSS_SOL: number;         // pausa el bot si la pérdida diaria supera esto (0 = off)
+  MAX_CONSECUTIVE_LOSSES: number;     // pausa el bot tras N pérdidas seguidas (0 = off)
+
+  // WebSocket watchdog
+  WS_MAX_SILENCE_MS: number;          // reconectar si no llega ningún mensaje en N ms
+
+  // Fees
+  DYNAMIC_PRIORITY_FEE: boolean;      // calcular priority fee según congestión de red
+  MAX_PRIORITY_FEE_SOL: number;       // techo del fee dinámico
+  SKIP_PREFLIGHT: boolean;            // true = más rápido, sin simulación previa
 }
 
 // -----------------------------------------------------------
@@ -143,6 +164,13 @@ export interface Position {
   bondingCurveKey: string;
   trades: TradeRecord[];
 
+  /** Wallet del creador del token — para detectar dev-sells */
+  creator?: string;
+  /** SOL real recibido acumulado en todas las ventas (neto de fees) */
+  solReceived?: number;
+  /** PnL realizado en SOL al cerrar (solReceived - solSpent) */
+  realizedPnlSol?: number;
+
   // ------- Trailing Stop Loss (inicializado por addPosition) -------
   /** Máximo market cap visto desde la apertura */
   highWaterMarkMcap?: number;
@@ -166,7 +194,9 @@ export type WebhookEvent =
   | 'TRADE_ERROR'
   | 'FILTER_REJECTED'
   | 'POSITION_CLOSED_TIME_EXPIRED'
-  | 'POSITION_CLOSED_EXTERNAL';
+  | 'POSITION_CLOSED_EXTERNAL'
+  | 'DEV_SELL_EXIT'
+  | 'CIRCUIT_BREAKER_TRIGGERED';
 
 export interface WebhookPayload {
   event: WebhookEvent;
@@ -180,6 +210,7 @@ export interface WebhookPayload {
   error?: string;
   filterReason?: string;
   pnlPercent?: number;       // PnL estimado en % al cerrar la posición
+  realizedPnlSol?: number;   // PnL REAL en SOL (SOL recibido - SOL gastado)
   timestamp: number;
   position?: Partial<Position>;
 }

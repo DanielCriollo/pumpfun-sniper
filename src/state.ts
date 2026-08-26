@@ -18,6 +18,9 @@ interface BotState {
 
   /** Mints suscritos a subscribeTokenTrade */
   subscribedMints: Set<string>;
+
+  /** Timestamp del último mensaje recibido por el WS (watchdog) */
+  lastWsMessageAt: number;
 }
 
 export const state: BotState = {
@@ -25,6 +28,7 @@ export const state: BotState = {
   wsInstance: null,
   reconnectAttempts: 0,
   subscribedMints: new Set(),
+  lastWsMessageAt: Date.now(),
 };
 
 // -----------------------------------------------------------
@@ -47,6 +51,10 @@ export function resetReconnects(): void {
   state.reconnectAttempts = 0;
 }
 
+export function markWsMessage(): void {
+  state.lastWsMessageAt = Date.now();
+}
+
 /**
  * Envía la suscripción al WebSocket activo.
  * Si el WS no está abierto, añade el mint al Set
@@ -60,6 +68,23 @@ export function subscribeToMintTrades(mint: string): void {
   ) {
     state.wsInstance.send(
       JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }),
+    );
+  }
+}
+
+/**
+ * Cancela la suscripción a trades de un mint y lo elimina del Set
+ * de re-suscripción. Llamar al cerrar/rechazar — evita acumular
+ * suscripciones muertas para siempre.
+ */
+export function unsubscribeMintTrades(mint: string): void {
+  if (!state.subscribedMints.delete(mint)) return;
+  if (
+    state.wsInstance &&
+    state.wsInstance.readyState === WebSocket.OPEN
+  ) {
+    state.wsInstance.send(
+      JSON.stringify({ method: 'unsubscribeTokenTrade', keys: [mint] }),
     );
   }
 }
