@@ -4,7 +4,7 @@ import { config } from './config';
 import { logger } from './logger';
 import { state, setPaused } from './state';
 import { executePanicSell, getPosition, getAllPositions } from './services/positionManager';
-import { getDailyStats } from './services/riskManager';
+import { getDailyStats, resetBreaker } from './services/riskManager';
 import { ApiResponse } from './types';
 
 // -----------------------------------------------------------
@@ -86,6 +86,10 @@ server.post<{ Params: { mint: string } }>(
 server.post('/api/toggle-pause', async (request, reply) => {
   const newState = !state.isPaused;
   setPaused(newState);
+
+  // Al reanudar manualmente, re-armar el circuit breaker para que
+  // las protecciones vuelvan a estar activas
+  if (!newState) resetBreaker();
 
   logger.info(
     { ip: request.ip, isPaused: newState },

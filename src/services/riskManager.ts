@@ -173,9 +173,12 @@ function maybeTripBreaker(): void {
     reason = `Pérdida diaria ${stats.realizedPnlSol.toFixed(4)} SOL alcanzó el límite de -${config.MAX_DAILY_LOSS_SOL} SOL`;
   } else if (
     config.MAX_CONSECUTIVE_LOSSES > 0 &&
-    stats.consecutiveLosses >= config.MAX_CONSECUTIVE_LOSSES
+    stats.consecutiveLosses >= config.MAX_CONSECUTIVE_LOSSES &&
+    stats.realizedPnlSol < 0
   ) {
-    reason = `${stats.consecutiveLosses} pérdidas consecutivas (límite: ${config.MAX_CONSECUTIVE_LOSSES})`;
+    // Solo frena por racha si el día va en rojo — una racha de pérdidas
+    // pequeñas en un día ganador es varianza normal, no una emergencia
+    reason = `${stats.consecutiveLosses} pérdidas consecutivas con día en negativo (${stats.realizedPnlSol.toFixed(4)} SOL)`;
   }
   if (!reason) return;
 
@@ -201,4 +204,19 @@ function maybeTripBreaker(): void {
 export function getDailyStats(): DailyStats {
   rolloverIfNeeded();
   return { ...stats };
+}
+
+/**
+ * Re-arma el circuit breaker tras una reanudación manual.
+ * Sin esto, un breaker disparado deja al bot SIN protección el resto
+ * del día (maybeTripBreaker ignora todo mientras breakerTripped=true).
+ */
+export function resetBreaker(): void {
+  rolloverIfNeeded();
+  if (!stats.breakerTripped && stats.consecutiveLosses === 0) return;
+  stats.breakerTripped = false;
+  stats.breakerReason = undefined;
+  stats.consecutiveLosses = 0;
+  saveStats();
+  logger.info('🔄 Circuit breaker re-armado tras reanudación manual');
 }
