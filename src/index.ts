@@ -475,7 +475,12 @@ function connectWebSocket(): void {
   }
 
   setTimeout(() => {
-    const ws = new WebSocket(config.WS_PUMPFUN_ENDPOINT);
+    // PumpPortal exige conectar con API key (wallet con >= 0.02 SOL)
+    // para poder usar subscribeTokenTrade — sin ella no llegan los trades
+    const wsUrl = config.PUMPPORTAL_API_KEY
+      ? `${config.WS_PUMPFUN_ENDPOINT}?api-key=${config.PUMPPORTAL_API_KEY}`
+      : config.WS_PUMPFUN_ENDPOINT;
+    const ws = new WebSocket(wsUrl);
     setWsInstance(ws);
 
     ws.on('open', () => {
@@ -648,6 +653,14 @@ async function main(): Promise<void> {
 
   // Grabador de firehose para backtesting offline
   startRecorder();
+
+  if (config.PUMPPORTAL_API_KEY === '') {
+    logger.warn(
+      '⚠️  PUMPPORTAL_API_KEY no configurada — PumpPortal NO enviará trades de tokens ' +
+      '(subscribeTokenTrade requiere API key con wallet de >= 0.02 SOL). ' +
+      'La observación de entrada y el TP/SL en tiempo real quedan CIEGOS sin esto.',
+    );
+  }
 
   // Iniciar API interna (Fastify)
   await startServer();

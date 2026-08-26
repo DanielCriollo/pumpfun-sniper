@@ -45,6 +45,7 @@ export const config: Config = {
   PUMPFUN_API_URL:
     process.env['PUMPFUN_API_URL'] ?? 'https://pumpportal.fun/api/trade-local',
   PRIVATE_KEY: requireEnv('PRIVATE_KEY'),
+  PUMPPORTAL_API_KEY: envString('PUMPPORTAL_API_KEY', ''),
 
   // Trading
   BUY_AMOUNT_SOL: envNumber('BUY_AMOUNT_SOL', 0.05),

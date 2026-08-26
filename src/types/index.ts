@@ -11,6 +11,8 @@ export interface Config {
   WS_PUMPFUN_ENDPOINT: string;
   PUMPFUN_API_URL: string;
   PRIVATE_KEY: string;
+  /** API key de PumpPortal — requerida por subscribeTokenTrade (wallet con >= 0.02 SOL) */
+  PUMPPORTAL_API_KEY: string;
 
   // Trading
   BUY_AMOUNT_SOL: number;
