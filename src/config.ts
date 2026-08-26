@@ -69,7 +69,7 @@ export const config: Config = {
   TRAILING_SL_DISTANCE_PERCENT: envNumber('TRAILING_SL_DISTANCE_PERCENT', 15),
 
   // Salida por tiempo
-  MAX_POSITION_HOLD_TIME_MINUTES: envNumber('MAX_POSITION_HOLD_TIME_MINUTES', 15),
+  MAX_HOLD_MINUTES: envNumber('MAX_HOLD_MINUTES', 15),
 
   // Servidor interno
   API_PORT: envNumber('API_PORT', 3000),
@@ -85,6 +85,9 @@ export const config: Config = {
 
   // Límites
   MAX_CONCURRENT_POSITIONS: envNumber('MAX_CONCURRENT_POSITIONS', 5),
+
+  // Position sizing dinámico
+  DYNAMIC_BUY_PERCENT: envNumber('DYNAMIC_BUY_PERCENT', 0),
 };
 
 // -----------------------------------------------------------

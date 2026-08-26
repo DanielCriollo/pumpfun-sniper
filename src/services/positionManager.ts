@@ -2,6 +2,8 @@ import { config } from '../config';
 import { logger } from '../logger';
 import { Position, TradeEvent, TradeRecord, WebhookEvent } from '../types';
 import { sellToken } from './pumpfun';
+import { reclaimAtaRent } from './solana';
+import { PublicKey } from '@solana/web3.js';
 import { sendWebhook } from './webhook';
 
 // -----------------------------------------------------------
@@ -283,11 +285,14 @@ async function executeSell(
       // SL, Panic o Time Expired: cerrar posición
       position.status = 'CLOSED';
       position.tokenBalance = 0;
+      // Reclamar rent de la ATA vacía (fire-and-forget)
+      void reclaimAtaRent(new PublicKey(position.mint));
     }
 
     // Si tras la venta no queda balance relevante (dust), cerrar
     if (position.tokenBalance < 1) {
       position.status = 'CLOSED';
+      void reclaimAtaRent(new PublicKey(position.mint));
     }
 
     logger.info(
@@ -373,7 +378,7 @@ export async function executePanicSell(mint: string): Promise<void> {
  */
 export function startPositionMonitor(): void {
   const intervalMs = 60_000;
-  const maxMs = config.MAX_POSITION_HOLD_TIME_MINUTES * 60_000;
+  const maxMs = config.MAX_HOLD_MINUTES * 60_000;
 
   setInterval(() => {
     const now = Date.now();
@@ -391,7 +396,7 @@ export function startPositionMonitor(): void {
           mint: position.mint,
           symbol: position.symbol,
           holdMinutes: holdMin,
-          limit: config.MAX_POSITION_HOLD_TIME_MINUTES,
+          limit: config.MAX_HOLD_MINUTES,
           tokenBalance: position.tokenBalance,
         },
         `⏰ Posición zombie detectada — cerrando por tiempo (${holdMin} min)`,
@@ -401,7 +406,7 @@ export function startPositionMonitor(): void {
         position,
         position.tokenBalance,
         'POSITION_CLOSED_TIME_EXPIRED',
-        `Time-based exit: posición abierta ${holdMin} min (límite: ${config.MAX_POSITION_HOLD_TIME_MINUTES} min)`,
+        `Time-based exit: posición abierta ${holdMin} min (límite: ${config.MAX_HOLD_MINUTES} min)`,
       );
     }
   }, intervalMs);
@@ -409,7 +414,7 @@ export function startPositionMonitor(): void {
   logger.info(
     {
       checkIntervalMin: 1,
-      maxHoldMin: config.MAX_POSITION_HOLD_TIME_MINUTES,
+      maxHoldMin: config.MAX_HOLD_MINUTES,
     },
     '⏱️  Monitor de tiempo de posiciones iniciado',
   );

@@ -79,22 +79,29 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
   // Ejecutar compra
   try {
     const solBalance = await getSolBalance();
-    if (solBalance < config.BUY_AMOUNT_SOL + 0.005) {
+
+    // Dynamic position sizing: usa % del SOL libre si DYNAMIC_BUY_PERCENT > 0
+    const buyAmount =
+      config.DYNAMIC_BUY_PERCENT > 0
+        ? Math.max(solBalance * (config.DYNAMIC_BUY_PERCENT / 100), 0.001)
+        : config.BUY_AMOUNT_SOL;
+
+    if (solBalance < buyAmount + 0.005) {
       logger.warn(
-        { solBalance, required: config.BUY_AMOUNT_SOL },
+        { solBalance, required: buyAmount },
         '⚠️  Balance insuficiente para comprar',
       );
       return;
     }
 
-    const buyResult = await buyToken(event.mint, config.BUY_AMOUNT_SOL);
+    const buyResult = await buyToken(event.mint, buyAmount);
 
     // Crear y registrar la posición
     const tradeRecord = {
       timestamp: Date.now(),
       action: 'BUY' as const,
       tokenAmount: buyResult.tokenBalance,
-      solAmount: config.BUY_AMOUNT_SOL,
+      solAmount: buyAmount,
       marketCapSol: event.marketCapSol,
       signature: buyResult.signature,
       reason: 'Filtros superados — compra inicial',
@@ -108,7 +115,7 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
       currentMarketCapSol: event.marketCapSol,
       tokenBalance: buyResult.tokenBalance,
       initialTokenBalance: buyResult.tokenBalance,
-      solSpent: config.BUY_AMOUNT_SOL,
+      solSpent: buyAmount,
       entryTimestamp: Date.now(),
       tp1Hit: false,
       tp2Hit: false,
@@ -129,7 +136,7 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
       name: event.name,
       symbol: event.symbol,
       marketCapSol: event.marketCapSol,
-      solAmount: config.BUY_AMOUNT_SOL,
+      solAmount: buyAmount,
       tokenAmount: buyResult.tokenBalance,
       signature: buyResult.signature,
       timestamp: Date.now(),
@@ -314,7 +321,7 @@ async function main(): Promise<void> {
 
   logger.info(
     {
-      buyAmount: config.BUY_AMOUNT_SOL,
+      buyMode: config.DYNAMIC_BUY_PERCENT > 0 ? `${config.DYNAMIC_BUY_PERCENT}% del balance` : `${config.BUY_AMOUNT_SOL} SOL fijo`,
       maxPositions: config.MAX_CONCURRENT_POSITIONS,
       tp1: `+${config.TP1_PERCENT}% → sell ${config.TP1_SELL_PERCENT}%`,
       tp2: `+${config.TP2_PERCENT}% → sell ${config.TP2_SELL_PERCENT}%`,

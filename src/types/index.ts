@@ -40,7 +40,7 @@ export interface Config {
   TRAILING_SL_DISTANCE_PERCENT: number;   // 15 → trailing SL = HWM - 15%
 
   // Salida por tiempo (posiciones zombie)
-  MAX_POSITION_HOLD_TIME_MINUTES: number; // 15 → cerrar posición si lleva > 15 min
+  MAX_HOLD_MINUTES: number;               // 15 → cerrar posición si lleva > 15 min
 
   // Servidor de control
   API_PORT: number;
@@ -56,6 +56,9 @@ export interface Config {
 
   // Límites
   MAX_CONCURRENT_POSITIONS: number;
+
+  // Position sizing dinámico (0 = desactivado → usa BUY_AMOUNT_SOL fijo)
+  DYNAMIC_BUY_PERCENT: number;
 }
 
 // -----------------------------------------------------------

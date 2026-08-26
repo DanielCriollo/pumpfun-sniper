@@ -11,6 +11,7 @@ import {
   getAccount,
   getAssociatedTokenAddress,
   TokenAccountNotFoundError,
+  createCloseAccountInstruction,
 } from '@solana/spl-token';
 import bs58 from 'bs58';
 import { config } from '../config';
@@ -150,4 +151,62 @@ export async function signAndSendTransaction(
 
   // TypeScript necesita este punto de retorno; nunca se alcanza
   throw new Error('Unreachable');
+}
+
+// -----------------------------------------------------------
+// Reclaim de renta de cuentas ATA vacías
+// -----------------------------------------------------------
+
+/**
+ * Cierra la ATA de `mint` si está vacía, recuperando ~0.002 SOL
+ * de renta bloqueada de vuelta a la wallet principal.
+ * Fire-and-forget seguro: loggea errores sin lanzarlos.
+ */
+export async function reclaimAtaRent(mint: PublicKey): Promise<void> {
+  try {
+    const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
+
+    // Verificar que la cuenta existe y tiene balance cero
+    const account = await getAccount(connection, ata, 'confirmed');
+    if (account.amount > 0n) {
+      logger.debug({ mint: mint.toBase58() }, 'reclaimAtaRent: ATA no vacía, omitiendo');
+      return;
+    }
+
+    const ix = createCloseAccountInstruction(
+      ata,              // cuenta a cerrar
+      wallet.publicKey, // destino del SOL (rent)
+      wallet.publicKey, // autoridad
+    );
+
+    const tx = new Transaction().add(ix);
+    const { blockhash, lastValidBlockHeight } =
+      await connection.getLatestBlockhash('confirmed');
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = wallet.publicKey;
+    tx.sign(wallet);
+
+    const sig = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+
+    const result = await connection.confirmTransaction(
+      { signature: sig, blockhash, lastValidBlockHeight },
+      'confirmed',
+    );
+
+    if (result.value.err) {
+      throw new Error(`ATA close on-chain error: ${JSON.stringify(result.value.err)}`);
+    }
+
+    logger.info(
+      { mint: mint.toBase58(), signature: sig },
+      '♻️  ATA cerrada — ~0.002 SOL de rent recuperados',
+    );
+  } catch (err) {
+    if (err instanceof TokenAccountNotFoundError) return; // ATA ya no existe
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn({ mint: mint.toBase58(), err: msg }, 'reclaimAtaRent: no se pudo cerrar ATA');
+  }
 }

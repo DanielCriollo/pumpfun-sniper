@@ -104,33 +104,35 @@ async function checkSocialLinks(event: NewTokenEvent): Promise<FilterResult> {
       clearTimeout(timeout);
     }
 
-    const hasTwitter =
-      typeof metadata.twitter === 'string' &&
-      metadata.twitter.trim().length > 0;
-    const hasTelegram =
-      typeof metadata.telegram === 'string' &&
-      metadata.telegram.trim().length > 0;
-    const hasWebsite =
-      typeof metadata.website === 'string' &&
-      metadata.website.trim().length > 0;
+    // Regex: exige handle real (mínimo 3 chars) — rechaza URLs genéricas sin path
+    const twitterRe = /(?:twitter\.com|x\.com)\/([a-zA-Z0-9_]{3,})/;
+    const telegramRe = /t\.me\/([a-zA-Z0-9_]{3,})/;
+
+    const rawTwitter  = typeof metadata.twitter  === 'string' ? metadata.twitter.trim()  : '';
+    const rawTelegram = typeof metadata.telegram  === 'string' ? metadata.telegram.trim() : '';
+    const rawWebsite  = typeof metadata.website   === 'string' ? metadata.website.trim()  : '';
+
+    const hasTwitter  = twitterRe.test(rawTwitter);
+    const hasTelegram = telegramRe.test(rawTelegram);
+    const hasWebsite  = rawWebsite.length > 10 && rawWebsite.startsWith('http');
 
     const hasSocialLink = hasTwitter || hasTelegram || hasWebsite;
 
     if (!hasSocialLink) {
+      const detail = [
+        rawTwitter  ? `twitter="${rawTwitter}"`  : '',
+        rawTelegram ? `telegram="${rawTelegram}"` : '',
+        rawWebsite  ? `website="${rawWebsite}"`   : '',
+      ].filter(Boolean).join(', ') || 'sin campos sociales';
       return {
         passed: false,
-        reason: 'Sin links sociales en metadatos (twitter/telegram/website)',
+        reason: `Links sociales inválidos o genéricos (${detail})`,
         score: 0,
       };
     }
 
     logger.debug(
-      {
-        mint: event.mint,
-        hasTwitter,
-        hasTelegram,
-        hasWebsite,
-      },
+      { mint: event.mint, hasTwitter, hasTelegram, hasWebsite },
       'Check socialLinks ✓',
     );
     return { passed: true, score: SCORE_SOCIAL_LINKS };
