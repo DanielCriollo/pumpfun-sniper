@@ -49,8 +49,21 @@ import { NewTokenEvent, TradeEvent, Position } from './types';
 
 /** Mints cuya compra está actualmente en proceso — previene doble entrada por mint */
 const inFlightMints = new Set<string>();
+/** Timestamp de inicio de cada compra en vuelo — para liberar slots atascados */
+const inFlightSince = new Map<string, number>();
 /** Compras actualmente en vuelo (incluye las que están en filtros/observación) */
 let inFlightBuyCount = 0;
+/** Tiempo máximo razonable de un intento de compra (filtros + observación + tx).
+ *  Pasado esto, el slot se considera atascado (p. ej. RPC colgada) y se libera. */
+const IN_FLIGHT_TIMEOUT_MS = 3 * 60_000;
+
+/** Libera el slot de un mint exactamente una vez (protege el contador) */
+function releaseInFlight(mint: string): void {
+  if (inFlightMints.delete(mint)) {
+    inFlightBuyCount--;
+  }
+  inFlightSince.delete(mint);
+}
 /** SOL comprometido en compras en vuelo — evita que compras concurrentes
  *  lean el mismo balance y violen MIN_SOL_RESERVE */
 let reservedSol = 0;
@@ -149,6 +162,7 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
 
   // Reservar slot SINCRÓNICAMENTE antes del primer await — previene la race condition
   inFlightMints.add(event.mint);
+  inFlightSince.set(event.mint, Date.now());
   inFlightBuyCount++;
 
   try {
@@ -363,8 +377,7 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
     });
   } finally {
     // Siempre liberar el slot, haya compra exitosa o error
-    inFlightMints.delete(event.mint);
-    inFlightBuyCount--;
+    releaseInFlight(event.mint);
     // Si no quedó posición (rechazo o error), limpiar la suscripción temporal
     if (!hasActivePosition(event.mint)) {
       unsubscribeMintTrades(event.mint);
@@ -569,10 +582,28 @@ function startMaintenance(): void {
     }
     pruneCreatorRegistry();
 
-    // Pulso de tráfico WS del último minuto — si trades=0 con tokens
-    // en observación, la suscripción a trades no está funcionando
+    // Liberar slots de compra atascados — una RPC colgada o una promesa
+    // que nunca resolvió NO puede bloquear el bot para siempre
+    for (const [mint, since] of inFlightSince) {
+      if (now - since > IN_FLIGHT_TIMEOUT_MS) {
+        logger.error(
+          { mint, stuckMinutes: ((now - since) / 60_000).toFixed(1) },
+          '🧯 Slot de compra en vuelo atascado — liberado a la fuerza',
+        );
+        releaseInFlight(mint);
+        if (!hasActivePosition(mint)) unsubscribeMintTrades(mint);
+      }
+    }
+
+    // Pulso de tráfico WS + estado interno del último minuto.
+    // trades=0 y other=0 sostenido con inFlight al máximo = slots atascados.
     logger.info(
-      { ...wsTraffic },
+      {
+        ...wsTraffic,
+        inFlight: inFlightBuyCount,
+        activePositions: getActivePositionCount(),
+        isPaused: state.isPaused,
+      },
       '📈 Tráfico WS último minuto (creates/trades/other)',
     );
     wsTraffic.creates = 0;

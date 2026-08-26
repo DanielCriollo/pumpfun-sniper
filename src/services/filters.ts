@@ -22,6 +22,20 @@ const SCORE_SOCIAL_LINKS = 30;
 const creatorCreations = new Map<string, number[]>();
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/** Timeout duro para llamadas RPC de filtros — una RPC colgada no debe
+ *  bloquear el slot de compra indefinidamente (fail-open) */
+const FILTER_RPC_TIMEOUT_MS = 5_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      const t = setTimeout(() => reject(new Error(`${label}: timeout ${ms}ms`)), ms);
+      t.unref();
+    }),
+  ]);
+}
+
 /** Registrar cada evento `create` visto, pase o no los filtros */
 export function registerTokenCreation(creator: string): void {
   const cutoff = Date.now() - DAY_MS;
@@ -65,10 +79,14 @@ export function checkCreatorLocal(creator: string): FilterResult {
 export async function checkCreatorHistory(creator: string): Promise<FilterResult> {
   if (!config.CHECK_CREATOR_HISTORY) return { passed: true, score: 0 };
   try {
-    const sigs = await connection.getSignaturesForAddress(
-      new PublicKey(creator),
-      { limit: config.CREATOR_HISTORY_MAX_TXS },
-      'confirmed',
+    const sigs = await withTimeout(
+      connection.getSignaturesForAddress(
+        new PublicKey(creator),
+        { limit: config.CREATOR_HISTORY_MAX_TXS },
+        'confirmed',
+      ),
+      FILTER_RPC_TIMEOUT_MS,
+      'checkCreatorHistory',
     );
     if (sigs.length >= config.CREATOR_HISTORY_MAX_TXS) {
       return {
@@ -97,7 +115,11 @@ export async function checkCreatorHistory(creator: string): Promise<FilterResult
 export async function checkHolderConcentration(mint: string): Promise<FilterResult> {
   if (config.MAX_HOLDER_PERCENT <= 0) return { passed: true, score: 0 };
   try {
-    const res = await connection.getTokenLargestAccounts(new PublicKey(mint), 'confirmed');
+    const res = await withTimeout(
+      connection.getTokenLargestAccounts(new PublicKey(mint), 'confirmed'),
+      FILTER_RPC_TIMEOUT_MS,
+      'checkHolderConcentration',
+    );
     // Ordenados desc — el mayor es (casi siempre) la bonding curve: se omite
     const holders = res.value.slice(1);
     for (const h of holders) {
