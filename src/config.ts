@@ -85,6 +85,8 @@ export const config: Config = {
 
   // Límites
   MAX_CONCURRENT_POSITIONS: envNumber('MAX_CONCURRENT_POSITIONS', 5),
+  MAX_ENTRY_MCAP_SOL: envNumber('MAX_ENTRY_MCAP_SOL', 60),      // rechazar si mcap inicial > X SOL (0 = desactivado)
+  MIN_SOL_RESERVE: envNumber('MIN_SOL_RESERVE', 0.02),            // SOL mínimo que el bot siempre conserva
 
   // Position sizing dinámico
   DYNAMIC_BUY_PERCENT: envNumber('DYNAMIC_BUY_PERCENT', 0),

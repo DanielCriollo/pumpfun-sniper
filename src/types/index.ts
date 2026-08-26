@@ -56,6 +56,8 @@ export interface Config {
 
   // Límites
   MAX_CONCURRENT_POSITIONS: number;
+  MAX_ENTRY_MCAP_SOL: number;   // 0 = sin límite; >0 = rechazar tokens con mcap mayor
+  MIN_SOL_RESERVE: number;      // SOL mínimo reservado en wallet (fees + buffer seguridad)
 
   // Position sizing dinámico (0 = desactivado → usa BUY_AMOUNT_SOL fijo)
   DYNAMIC_BUY_PERCENT: number;

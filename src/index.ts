@@ -27,27 +27,58 @@ import { NewTokenEvent, TradeEvent, Position } from './types';
 // -----------------------------------------------------------
 
 // -----------------------------------------------------------
+// Guards de concurrencia y deduplicación
+// -----------------------------------------------------------
+
+/** Mints cuya compra está actualmente en proceso — previene doble entrada por mint */
+const inFlightMints = new Set<string>();
+/** Compras actualmente en vuelo (incluye las que están en filtros/fetch) */
+let inFlightBuyCount = 0;
+/** Mapa símbolo → timestamp de última compra — evita entrar dos veces en el mismo proyecto */
+const recentSymbolBuys = new Map<string, number>();
+const SYMBOL_COOLDOWN_MS = 30_000; // 30 segundos
+
+// -----------------------------------------------------------
 // Handlers de eventos WebSocket
 // -----------------------------------------------------------
 
 async function handleNewToken(event: NewTokenEvent): Promise<void> {
-  // Respetar modo pausa
+  // 1. Respetar modo pausa
   if (state.isPaused) {
     logger.debug({ mint: event.mint }, 'Bot pausado — token ignorado');
     return;
   }
 
-  // Límite de posiciones concurrentes
-  if (getActivePositionCount() >= config.MAX_CONCURRENT_POSITIONS) {
+  // 2. Guard atómico: evitar doble procesamiento del mismo mint
+  if (inFlightMints.has(event.mint) || hasActivePosition(event.mint)) return;
+
+  // 3. Límite de posiciones: activas + en vuelo (chequeo atómico pre-await)
+  const totalActive = getActivePositionCount() + inFlightBuyCount;
+  if (totalActive >= config.MAX_CONCURRENT_POSITIONS) {
     logger.warn(
-      { mint: event.mint, active: getActivePositionCount() },
+      { mint: event.mint, active: getActivePositionCount(), inFlight: inFlightBuyCount },
       'Límite de posiciones alcanzado — token ignorado',
     );
     return;
   }
 
-  // Evitar doble compra del mismo mint
-  if (hasActivePosition(event.mint)) {
+  // 4. Guard de símbolo reciente (evita comprar el mismo proyecto varias veces en 30s)
+  const symbolKey = event.symbol.toUpperCase();
+  const lastSymbolBuy = recentSymbolBuys.get(symbolKey);
+  if (lastSymbolBuy && Date.now() - lastSymbolBuy < SYMBOL_COOLDOWN_MS) {
+    logger.debug(
+      { symbol: event.symbol, mint: event.mint, msSinceLast: Date.now() - lastSymbolBuy },
+      '⏳ Símbolo comprado hace <30s — ignorado',
+    );
+    return;
+  }
+
+  // 5. Filtro de market cap de entrada (mcap alto = menor upside potencial)
+  if (config.MAX_ENTRY_MCAP_SOL > 0 && event.marketCapSol > config.MAX_ENTRY_MCAP_SOL) {
+    logger.debug(
+      { mint: event.mint, mcap: event.marketCapSol, max: config.MAX_ENTRY_MCAP_SOL },
+      '📉 Market cap inicial demasiado alto — ignorado',
+    );
     return;
   }
 
@@ -61,23 +92,27 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
     `🆕 Nuevo token detectado: ${event.symbol}`,
   );
 
-  // Aplicar filtros anti-rug
-  const filterResult = await applyFilters(event);
-  if (!filterResult.passed) {
-    await sendWebhook({
-      event: 'FILTER_REJECTED',
-      mint: event.mint,
-      name: event.name,
-      symbol: event.symbol,
-      marketCapSol: event.marketCapSol,
-      filterReason: filterResult.reason,
-      timestamp: Date.now(),
-    });
-    return;
-  }
+  // Reservar slot SINCRÓNICAMENTE antes del primer await — previene la race condition
+  inFlightMints.add(event.mint);
+  inFlightBuyCount++;
 
-  // Ejecutar compra
   try {
+    // Aplicar filtros anti-rug (incluye fetch de metadatos — operación async)
+    const filterResult = await applyFilters(event);
+    if (!filterResult.passed) {
+      await sendWebhook({
+        event: 'FILTER_REJECTED',
+        mint: event.mint,
+        name: event.name,
+        symbol: event.symbol,
+        marketCapSol: event.marketCapSol,
+        filterReason: filterResult.reason,
+        timestamp: Date.now(),
+      });
+      return;
+    }
+
+    // Verificar balance antes de comprar
     const solBalance = await getSolBalance();
 
     // Dynamic position sizing: usa % del SOL libre si DYNAMIC_BUY_PERCENT > 0
@@ -86,15 +121,19 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
         ? Math.max(solBalance * (config.DYNAMIC_BUY_PERCENT / 100), 0.001)
         : config.BUY_AMOUNT_SOL;
 
-    if (solBalance < buyAmount + 0.005) {
+    // Reserva mínima de SOL — siempre conservar MIN_SOL_RESERVE para fees
+    if (solBalance < buyAmount + config.MIN_SOL_RESERVE) {
       logger.warn(
-        { solBalance, required: buyAmount },
-        '⚠️  Balance insuficiente para comprar',
+        { solBalance, required: buyAmount, reserve: config.MIN_SOL_RESERVE },
+        '⚠️  Balance insuficiente — reserva mínima protegida',
       );
       return;
     }
 
     const buyResult = await buyToken(event.mint, buyAmount);
+
+    // Registrar símbolo como comprado (antes de addPosition para proteger contra errores)
+    recentSymbolBuys.set(symbolKey, Date.now());
 
     // Crear y registrar la posición
     const tradeRecord = {
@@ -156,6 +195,10 @@ async function handleNewToken(event: NewTokenEvent): Promise<void> {
       error: errMsg,
       timestamp: Date.now(),
     });
+  } finally {
+    // Siempre liberar el slot, haya compra exitosa o error
+    inFlightMints.delete(event.mint);
+    inFlightBuyCount--;
   }
 }
 
@@ -326,6 +369,8 @@ async function main(): Promise<void> {
       tp1: `+${config.TP1_PERCENT}% → sell ${config.TP1_SELL_PERCENT}%`,
       tp2: `+${config.TP2_PERCENT}% → sell ${config.TP2_SELL_PERCENT}%`,
       sl: `-${config.SL_PERCENT}%`,
+      maxMcapEntry: config.MAX_ENTRY_MCAP_SOL > 0 ? `${config.MAX_ENTRY_MCAP_SOL} SOL` : 'sin límite',
+      minSolReserve: `${config.MIN_SOL_RESERVE} SOL`,
     },
     '⚙️  Parámetros de trading',
   );

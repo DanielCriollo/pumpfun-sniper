@@ -16,6 +16,10 @@ interface PumpTradeParams {
   denominatedInSol: boolean;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Llama a la API de PumpPortal para obtener la transacción serializada,
  * la firma con nuestro wallet y la envía a la red.
@@ -68,6 +72,44 @@ async function executePumpTrade(params: PumpTradeParams): Promise<string> {
 }
 
 // -----------------------------------------------------------
+// Retry de balance tras compra — la RPC tarda en propagar el ATA
+// -----------------------------------------------------------
+
+/**
+ * Reintenta leer el balance del token hasta que sea > 0.
+ * La RPC puede tardar varios segundos en ver el ATA recién creado.
+ * Hasta maxAttempts intentos con delayMs ms de espera entre ellos.
+ */
+async function waitForTokenBalance(
+  mint: PublicKey,
+  maxAttempts = 5,
+  delayMs = 1500,
+): Promise<number> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const bal = await getTokenDisplayBalance(mint);
+    if (bal > 0) {
+      logger.debug(
+        { mint: mint.toBase58(), attempt, bal },
+        'Balance token confirmado tras propagación RPC',
+      );
+      return bal;
+    }
+    if (attempt < maxAttempts) {
+      logger.debug(
+        { mint: mint.toBase58(), attempt, maxAttempts },
+        `Balance aún 0 — esperando propagación RPC (intento ${attempt}/${maxAttempts})`,
+      );
+      await sleep(delayMs);
+    }
+  }
+  logger.warn(
+    { mint: mint.toBase58(), maxAttempts },
+    '⚠️  Balance sigue en 0 tras todos los reintentos — posición registrada con balance=0',
+  );
+  return 0;
+}
+
+// -----------------------------------------------------------
 // Compra
 // -----------------------------------------------------------
 
@@ -97,8 +139,8 @@ export async function buyToken(
     denominatedInSol: true,
   });
 
-  // Obtener balance real desde la cadena para evitar estimaciones
-  const tokenBalance = await getTokenDisplayBalance(new PublicKey(mint));
+  // Reintentar hasta obtener balance real — la RPC tarda en propagar el ATA
+  const tokenBalance = await waitForTokenBalance(new PublicKey(mint));
 
   logger.info(
     { mint, signature, tokenBalance, solAmount },
