@@ -34,6 +34,11 @@ import {
   ObservationResult,
 } from './services/observer';
 import { initRiskManager } from './services/riskManager';
+import {
+  isCopyWallet,
+  handleCopySignal,
+  copyWalletCount,
+} from './services/copyTrader';
 import { sendWebhook } from './services/webhook';
 import { startServer } from './server';
 import { getSolBalance, sweepProfits } from './services/solana';
@@ -76,6 +81,9 @@ const SYMBOL_COOLDOWN_MS = 30_000; // 30 segundos
 // -----------------------------------------------------------
 
 async function handleNewToken(event: NewTokenEvent): Promise<void> {
+  // Estrategia sniper desactivada (modo solo-copy)
+  if (!config.SNIPER_ENABLED) return;
+
   // Algunos eventos `create` llegan sin symbol/name — normalizar para no crashear
   event.symbol = event.symbol ?? '';
   event.name = event.name ?? '';
@@ -433,8 +441,16 @@ function onWsMessage(data: WebSocket.RawData): void {
   } else if (txType === 'buy' || txType === 'sell') {
     wsTraffic.trades++;
     const event = parsed as unknown as TradeEvent;
-    // Grabar TODOS los trades que llegan (solo llegan de mints suscritos)
+    // Grabar TODOS los trades que llegan (solo llegan de mints suscritos
+    // y de las wallets copiadas)
     recordFirehose('trade', parsed);
+    // Señal de wallet copiada → espejo (no consume: el evento sigue
+    // fluyendo a observación/posiciones, donde también aporta datos)
+    if (isCopyWallet(event.traderPublicKey)) {
+      void handleCopySignal(event).catch((err) => {
+        logger.error({ err }, 'Error no capturado en handleCopySignal');
+      });
+    }
     // Los mints bajo observación consumen el evento aquí
     if (handleObservationTrade(event)) return;
     void (async () => {
@@ -503,6 +519,20 @@ function connectWebSocket(): void {
 
       // Suscribirse a nuevos tokens
       ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+
+      // Copy-trading: suscribirse a los trades de las wallets seguidas
+      if (config.COPY_WALLETS.length > 0) {
+        ws.send(
+          JSON.stringify({
+            method: 'subscribeAccountTrade',
+            keys: config.COPY_WALLETS,
+          }),
+        );
+        logger.info(
+          { wallets: config.COPY_WALLETS.length },
+          '👣 Suscrito a trades de wallets copiadas',
+        );
+      }
 
       // Re-suscribirse a los mints de posiciones activas (en un solo mensaje)
       if (state.subscribedMints.size > 0) {
@@ -713,10 +743,14 @@ async function main(): Promise<void> {
     {
       mode: config.DRY_RUN ? `DRY RUN (balance virtual ${config.DRY_RUN_START_BALANCE_SOL} SOL)` : 'REAL',
       buyMode: config.DYNAMIC_BUY_PERCENT > 0 ? `${config.DYNAMIC_BUY_PERCENT}% del balance` : `${config.BUY_AMOUNT_SOL} SOL fijo`,
-      entryMode:
-        config.ENTRY_OBSERVATION_SECONDS > 0
-          ? `observación ${config.ENTRY_OBSERVATION_SECONDS}s (mín. ${config.MIN_UNIQUE_BUYERS} compradores)`
-          : 'snipe inmediato',
+      sniper: config.SNIPER_ENABLED
+        ? (config.ENTRY_OBSERVATION_SECONDS > 0
+            ? `observación ${config.ENTRY_OBSERVATION_SECONDS}s (mín. ${config.MIN_UNIQUE_BUYERS} compradores)`
+            : 'snipe inmediato')
+        : 'DESACTIVADO',
+      copyTrading: copyWalletCount() > 0
+        ? `${copyWalletCount()} wallets (mín. ${config.COPY_MIN_BUY_SOL} SOL por señal)`
+        : 'desactivado',
       maxPositions: config.MAX_CONCURRENT_POSITIONS,
       tp1: `+${config.TP1_PERCENT}% → sell ${config.TP1_SELL_PERCENT}%`,
       tp2: `+${config.TP2_PERCENT}% → sell ${config.TP2_SELL_PERCENT}%`,

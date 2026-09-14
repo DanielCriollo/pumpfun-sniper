@@ -104,6 +104,14 @@ export const config: Config = {
   MIN_UNIQUE_BUYERS: envNumber('MIN_UNIQUE_BUYERS', 4),
   MIN_VSOL_IN_CURVE: envNumber('MIN_VSOL_IN_CURVE', 33),
 
+  // Estrategias
+  SNIPER_ENABLED: envBool('SNIPER_ENABLED', true),
+  COPY_WALLETS: envString('COPY_WALLETS', '')
+    .split(',')
+    .map((w) => w.trim())
+    .filter((w) => w.length >= 32),
+  COPY_MIN_BUY_SOL: envNumber('COPY_MIN_BUY_SOL', 0.3),
+
   // Filtros de creador
   CREATOR_MAX_TOKENS_PER_DAY: envNumber('CREATOR_MAX_TOKENS_PER_DAY', 1),
   CHECK_CREATOR_HISTORY: envBool('CHECK_CREATOR_HISTORY', true),
@@ -167,4 +175,7 @@ if (
   config.PROFIT_SWEEP_KEEP_SOL >= config.PROFIT_SWEEP_THRESHOLD_SOL
 ) {
   throw new Error('[Config] PROFIT_SWEEP_KEEP_SOL debe ser menor que PROFIT_SWEEP_THRESHOLD_SOL');
+}
+if (!config.SNIPER_ENABLED && config.COPY_WALLETS.length === 0) {
+  throw new Error('[Config] SNIPER_ENABLED=false requiere al menos una wallet en COPY_WALLETS');
 }

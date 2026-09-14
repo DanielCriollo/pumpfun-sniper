@@ -42,6 +42,7 @@ const DEFENSIVE_EVENTS: WebhookEvent[] = [
   'POSITION_CLOSED_TIME_EXPIRED',
   'VOLUME_DEATH_EXIT',
   'PANIC_SELL',
+  'COPY_SELL_EXIT',
 ];
 
 const DATA_DIR = nodePath.join(process.cwd(), 'data');
@@ -665,6 +666,20 @@ async function executeSell(
 // -----------------------------------------------------------
 // Panic Sell — llamado desde el servidor HTTP
 // -----------------------------------------------------------
+
+/**
+ * Salida disparada por una señal externa (p. ej. la wallet copiada vendió).
+ * Tolerante: si no hay posición activa en el mint, no hace nada.
+ */
+export async function executeSignalExit(
+  mint: string,
+  event: WebhookEvent,
+  reason: string,
+): Promise<void> {
+  const position = positions.get(mint);
+  if (!position || position.status !== 'ACTIVE') return;
+  await executeSell(position, position.tokenBalance, event, reason);
+}
 
 export async function executePanicSell(mint: string): Promise<void> {
   const position = positions.get(mint);

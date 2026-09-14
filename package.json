@@ -10,7 +10,8 @@
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test dist/tests/",
-    "report": "node dist/tools/report.js"
+    "report": "node dist/tools/report.js",
+    "topwallets": "node dist/tools/topwallets.js"
   },
   "dependencies": {
     "@fastify/rate-limit": "^9.1.0",

@@ -21,6 +21,8 @@ interface ClosedPosition {
   realizedPnlSol?: number;
   entryTimestamp: number;
   exitEvent?: string;
+  strategy?: string;
+  copiedFrom?: string;
   entryContext?: {
     uniqueBuyers?: number;
     devBuyPercent?: number;
@@ -150,6 +152,22 @@ function main(): void {
     console.log(`  Hold mediano:     ${medianHold.toFixed(1)} min`);
     console.log(`  Mejor:            ${best.symbol || best.mint.slice(0, 8)} ${sol(best.realizedPnlSol ?? 0)}`);
     console.log(`  Peor:             ${worst.symbol || worst.mint.slice(0, 8)} ${sol(worst.realizedPnlSol ?? 0)}`);
+
+    // ---------- Por estrategia (sniper vs copy) ----------
+    const byStrategy = new Map<string, Bucket>();
+    for (const p of closed) {
+      bucketAdd(byStrategy, p.strategy ?? 'sniper', p.realizedPnlSol ?? 0);
+    }
+    printBuckets('PnL por estrategia', byStrategy);
+
+    // ---------- Por wallet copiada ----------
+    const byWallet = new Map<string, Bucket>();
+    for (const p of closed) {
+      if (!p.copiedFrom) continue;
+      const short = `${p.copiedFrom.slice(0, 4)}…${p.copiedFrom.slice(-4)}`;
+      bucketAdd(byWallet, short, p.realizedPnlSol ?? 0);
+    }
+    printBuckets('PnL por wallet copiada', byWallet);
 
     // ---------- Por razón de salida ----------
     const byExit = new Map<string, Bucket>();

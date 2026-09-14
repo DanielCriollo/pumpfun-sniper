@@ -74,6 +74,15 @@ export interface Config {
    *  vacías donde el mcap es ilusorio. 0 = desactivado. */
   MIN_VSOL_IN_CURVE: number;
 
+  // Estrategia sniper on/off (false = solo copy-trading)
+  SNIPER_ENABLED: boolean;
+
+  // Copy-trading — espejo de wallets ganadoras
+  /** Wallets a seguir (lista separada por comas en el .env). Vacío = modo copy desactivado */
+  COPY_WALLETS: string[];
+  /** Solo copiar compras de la wallet seguida >= este monto (filtra ruido/dust) */
+  COPY_MIN_BUY_SOL: number;
+
   // Filtros de creador
   CREATOR_MAX_TOKENS_PER_DAY: number; // máx. tokens creados por el mismo dev en 24h
   CHECK_CREATOR_HISTORY: boolean;     // consulta RPC del historial del dev
@@ -220,6 +229,10 @@ export interface Position {
   entryContext?: EntryContext;
   /** Evento que cerró la posición (SL_TRIGGERED, TP..., DEV_SELL_EXIT, etc.) */
   exitEvent?: string;
+  /** Estrategia que abrió la posición (default histórico: sniper) */
+  strategy?: 'sniper' | 'copy';
+  /** Wallet seguida que originó la entrada (solo strategy=copy) */
+  copiedFrom?: string;
 
   // ------- Trailing Stop Loss (inicializado por addPosition) -------
   /** Máximo market cap visto desde la apertura */
@@ -249,7 +262,8 @@ export type WebhookEvent =
   | 'CIRCUIT_BREAKER_TRIGGERED'
   | 'VOLUME_DEATH_EXIT'
   | 'DAILY_SUMMARY'
-  | 'PROFIT_SWEPT';
+  | 'PROFIT_SWEPT'
+  | 'COPY_SELL_EXIT';
 
 export interface WebhookPayload {
   event: WebhookEvent;
