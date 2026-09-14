@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test dist/tests/",
     "report": "node dist/tools/report.js",
-    "topwallets": "node dist/tools/topwallets.js"
+    "topwallets": "node dist/tools/topwallets.js",
+    "validatewallets": "node dist/tools/validatewallets.js"
   },
   "dependencies": {
     "@fastify/rate-limit": "^9.1.0",
