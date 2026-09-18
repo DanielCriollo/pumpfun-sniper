@@ -76,6 +76,16 @@ function rolloverIfNeeded(): void {
   stats = freshStats();
   saveStats();
 
+  // Los límites son DIARIOS: si el breaker había pausado el bot, el nuevo día
+  // UTC lo reanuda (una pausa manual vía /api/toggle-pause no pasa por aquí)
+  if (prev.breakerTripped) {
+    setPaused(false);
+    logger.info(
+      { previousReason: prev.breakerReason },
+      '▶️  Nuevo día UTC — circuit breaker reseteado, bot reanudado automáticamente',
+    );
+  }
+
   // Resumen diario hacia n8n (→ Telegram/email) — solo si hubo actividad
   if (prev.trades > 0) {
     void sendWebhook({

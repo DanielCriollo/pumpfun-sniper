@@ -33,7 +33,7 @@ import {
   handleObservationTrade,
   ObservationResult,
 } from './services/observer';
-import { initRiskManager } from './services/riskManager';
+import { initRiskManager, getDailyStats } from './services/riskManager';
 import {
   isCopyWallet,
   handleCopySignal,
@@ -611,6 +611,10 @@ function startMaintenance(): void {
       if (now - ts > SYMBOL_COOLDOWN_MS) recentSymbolBuys.delete(symbol);
     }
     pruneCreatorRegistry();
+
+    // Fuerza el rollover diario del risk manager aunque no cierre ningún trade
+    // (un bot pausado por el breaker nunca cerraría uno y no se reanudaría)
+    getDailyStats();
 
     // Liberar slots de compra atascados — una RPC colgada o una promesa
     // que nunca resolvió NO puede bloquear el bot para siempre
